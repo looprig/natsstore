@@ -1,8 +1,10 @@
 package natsstore
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"strconv"
 	"time"
 
@@ -255,6 +257,102 @@ func leaseBucketConfig(bucket string, ttl time.Duration) jetstream.KeyValueConfi
 		TTL:      backstopBucketTTL(ttl),
 		Storage:  jetstream.FileStorage,
 		History:  1,
+		Replicas: 1,
+	}
+}
+
+// jetStreamObjectSeam is the production objSeam: it binds the blob store's five operations
+// to a real, context-aware jetstream.ObjectStore, translating ObjectStore's absence
+// sentinels (ErrObjectNotFound / ErrNoObjectsFound) onto the store's package terms
+// (errObjNotFound / empty listing) and decoding the stored "SHA-256=<base64>" digest to
+// raw bytes for the store's content compare. It is the ONLY blob code that talks to NATS
+// directly.
+type jetStreamObjectSeam struct {
+	obj jetstream.ObjectStore
+}
+
+var _ objSeam = (*jetStreamObjectSeam)(nil)
+
+// newJetStreamObjectSeam wraps obj as a production blob-store seam.
+func newJetStreamObjectSeam(obj jetstream.ObjectStore) *jetStreamObjectSeam {
+	return &jetStreamObjectSeam{obj: obj}
+}
+
+// put stores data under key (ObjectStore computes and records the SHA-256 digest itself),
+// bounded by ctx. ObjectStore.Put replaces any prior object at the name — the store only
+// calls put for a new object, so no live content is clobbered.
+func (s *jetStreamObjectSeam) put(ctx context.Context, key string, data []byte) error {
+	_, err := s.obj.Put(ctx, jetstream.ObjectMeta{Name: key}, bytes.NewReader(data))
+	return err
+}
+
+// get returns an ObjectStore result (an io.ReadCloser that verifies the digest on read),
+// bounded by ctx, or errObjNotFound if absent.
+func (s *jetStreamObjectSeam) get(ctx context.Context, key string) (io.ReadCloser, error) {
+	res, err := s.obj.Get(ctx, key)
+	if err != nil {
+		if errors.Is(err, jetstream.ErrObjectNotFound) {
+			return nil, errObjNotFound
+		}
+		return nil, err
+	}
+	return res, nil
+}
+
+// delete removes key, bounded by ctx. An absent object surfaces as
+// jetstream.ErrObjectNotFound, which is mapped to success — the idempotent Delete contract.
+func (s *jetStreamObjectSeam) delete(ctx context.Context, key string) error {
+	err := s.obj.Delete(ctx, key)
+	if err == nil || errors.Is(err, jetstream.ErrObjectNotFound) {
+		return nil
+	}
+	return err
+}
+
+// list returns every live object name, bounded by ctx. An empty store surfaces as
+// jetstream.ErrNoObjectsFound, mapped to an empty slice (absent == empty), not an error.
+func (s *jetStreamObjectSeam) list(ctx context.Context) ([]string, error) {
+	infos, err := s.obj.List(ctx)
+	if err != nil {
+		if errors.Is(err, jetstream.ErrNoObjectsFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	names := make([]string, 0, len(infos))
+	for _, info := range infos {
+		names = append(names, info.Name)
+	}
+	return names, nil
+}
+
+// getInfo returns the RAW SHA-256 digest of the object at key, bounded by ctx, or
+// errObjNotFound if absent. ObjectStore stores the digest as "SHA-256=<base64url>";
+// jetstream.DecodeObjectDigest reverses that to the 32 raw bytes the store compares. A
+// malformed stored digest is a genuine backend fault (returned as-is, fail closed).
+func (s *jetStreamObjectSeam) getInfo(ctx context.Context, key string) ([]byte, error) {
+	info, err := s.obj.GetInfo(ctx, key)
+	if err != nil {
+		if errors.Is(err, jetstream.ErrObjectNotFound) {
+			return nil, errObjNotFound
+		}
+		return nil, err
+	}
+	digest, err := jetstream.DecodeObjectDigest(info.Digest)
+	if err != nil {
+		return nil, err
+	}
+	return digest, nil
+}
+
+// objectStoreConfig returns the jetstream ObjectStore configuration for the blob store's
+// bucket: file storage and one replica (single-node embedded). MaxBytes is left at the
+// default (unlimited); ObjectStore chunks large objects, so the storekit 1 MiB blob floor
+// round-trips without special sizing.
+func objectStoreConfig(bucket string) jetstream.ObjectStoreConfig {
+	return jetstream.ObjectStoreConfig{
+		Bucket:   bucket,
+		Storage:  jetstream.FileStorage,
 		Replicas: 1,
 	}
 }

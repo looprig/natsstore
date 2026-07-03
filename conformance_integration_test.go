@@ -111,6 +111,49 @@ func TestKVConformance(t *testing.T) {
 	})
 }
 
+// newBlobsBackend stands up a fresh embedded engine on its own StoreDir, provisions an
+// ObjectStore over it, and returns a blobStore over the production object seam. Each call
+// is fully isolated (its own engine + object store), so conformance subtests never collide
+// on one store and the store sees the caller's real, unmangled keys.
+func newBlobsBackend(t *testing.T, root string, counter *atomic.Uint64) *blobStore {
+	t.Helper()
+	n := counter.Add(1)
+	dir := filepath.Join(root, "ob"+strconv.FormatUint(n, 10), "jetstream")
+	eng, err := Open(EngineOptions{DataDir: dir, SyncInterval: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("Open engine: %v", err)
+	}
+	t.Cleanup(func() { _ = eng.Close() })
+	js, err := jetstream.New(eng.Conn())
+	if err != nil {
+		t.Fatalf("jetstream.New: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	obj, err := js.CreateObjectStore(ctx, objectStoreConfig("looprig_blobs"))
+	if err != nil {
+		t.Fatalf("CreateObjectStore: %v", err)
+	}
+	return newBlobStore(newJetStreamObjectSeam(obj))
+}
+
+// TestBlobsConformance runs the full storekit Blobs conformance suite against the
+// JetStream-ObjectStore-backed store over an embedded, in-process engine (no network).
+// Every factory call gets a FRESH engine + object store on its own StoreDir, so each
+// subtest is isolated and the store sees the caller's real, unmangled keys (the suite
+// asserts on BlobNotFoundError.Key / BlobConflictError.Key / InvalidNameError.Name). It
+// exercises the 1 MiB blob floor, the content-addressed identical-no-op /
+// different-conflict semantics (original untouched), and sorted+deduped prefix listings.
+func TestBlobsConformance(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", root)
+	var counter atomic.Uint64
+
+	storetest.TestBlobs(t, func(t *testing.T) storekit.Blobs {
+		return newBlobsBackend(t, root, &counter)
+	})
+}
+
 // TestLeaserConformance runs the full storekit Leaser conformance suite against the
 // JetStream-KV-backed leaser over an embedded, in-process engine (no network). Every
 // factory call gets a FRESH engine + bucket on its own StoreDir, so each subtest is
