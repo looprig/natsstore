@@ -93,6 +93,13 @@ var errServerNotReady = errors.New("natsstore: embedded server not ready within 
 type EngineOptions struct {
 	DataDir      string
 	SyncInterval time.Duration
+	// MaxPayload is the connection-level maximum message size the DontListen server
+	// accepts. A zero/negative value falls back to the package default (maxPayload,
+	// 8 MiB). It must be >= the ledger stream's per-message ceiling (ledgerMaxMsgSize)
+	// so a floor-sized append is not rejected at the connection; natsstore.Open's
+	// embedded mode validates that floor before driving the engine, and openEngineAt
+	// applies the default when this is unset.
+	MaxPayload int32
 }
 
 // DefaultEngineOptions returns convenience engine options: StoreDir at
@@ -158,13 +165,15 @@ type Engine struct {
 	js  nats.JetStreamContext
 }
 
-// Open starts an embedded JetStream server on a confined StoreDir, connects to it
-// in-process (no TCP), and returns a live Engine. The StoreDir is created 0700 if absent
-// and is verified to stay within the home/XDG root (fail-secure against traversal). The
-// SyncInterval is set explicitly on the server options (the power-loss knob); a zero
-// value falls back to the conservative default. On any failure the partially-started
-// server is shut down before returning the typed error, so Open never leaks a server.
-func Open(opts EngineOptions) (*Engine, error) {
+// OpenEngine starts an embedded JetStream server on a home/XDG-CONFINED StoreDir,
+// connects to it in-process (no TCP), and returns a live Engine. It resolves the
+// containment root ($XDG_DATA_HOME or home), verifies opts.DataDir stays within it
+// (fail-secure against traversal), then hands off to openEngineAt for the fail-secure
+// startup. It is the confined convenience entry point (the ~/.looprig / $XDG_DATA_HOME
+// app-policy path); natsstore.Open's embedded mode instead drives openEngineAt directly
+// on a caller-owned absolute dir, deliberately WITHOUT this home/XDG confinement (the
+// caller explicitly owns the path).
+func OpenEngine(opts EngineOptions) (*Engine, error) {
 	root, err := containmentRoot()
 	if err != nil {
 		return nil, err
@@ -173,24 +182,36 @@ func Open(opts EngineOptions) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
+	return openEngineAt(storeDir, opts.SyncInterval, opts.MaxPayload)
+}
+
+// openEngineAt is the fail-secure half of engine startup, shared by OpenEngine (which
+// confines storeDir to the home/XDG root first) and natsstore.Open's embedded mode
+// (which passes a caller-owned absolute dir directly, no confinement). storeDir must be
+// already resolved and cleaned by the caller. It creates storeDir 0700 if absent, starts
+// the DontListen server (SyncInterval and MaxPayload defaulted when non-positive), and
+// connects in-process. On any failure the partially-started server is shut down before
+// returning the typed error, so it never leaks a server.
+func openEngineAt(storeDir string, sync time.Duration, maxPay int32) (*Engine, error) {
 	// #nosec G301 -- StoreDir is owner-only by design (may hold conversation content).
 	if err := os.MkdirAll(storeDir, storeDirPerm); err != nil {
 		return nil, &StoreDirError{Path: storeDir, Cause: err}
 	}
-
-	sync := opts.SyncInterval
 	if sync <= 0 {
 		sync = defaultSyncInterval
+	}
+	if maxPay <= 0 {
+		maxPay = maxPayload
 	}
 
 	srv, err := server.NewServer(&server.Options{
 		JetStream:    true,
 		StoreDir:     storeDir,
-		DontListen:   true,       // in-process only — no TCP socket
-		SyncInterval: sync,       // explicit power-loss durability knob
-		MaxPayload:   maxPayload, // accept the storekit 1 MiB payload floor + JetStream framing (default is 1 MB)
-		NoSigs:       true,       // the consumer owns signal handling; the server must not install handlers
-		NoLog:        true,       // server logs would corrupt a TUI's stdout/scrollback
+		DontListen:   true,   // in-process only — no TCP socket
+		SyncInterval: sync,   // explicit power-loss durability knob
+		MaxPayload:   maxPay, // accept the storekit 1 MiB payload floor + JetStream framing (default is 1 MB)
+		NoSigs:       true,   // the consumer owns signal handling; the server must not install handlers
+		NoLog:        true,   // server logs would corrupt a TUI's stdout/scrollback
 	})
 	if err != nil {
 		return nil, &ServerStartError{Cause: err}

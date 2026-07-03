@@ -22,7 +22,7 @@ func TestEngineLifecycle(t *testing.T) {
 	t.Setenv("XDG_DATA_HOME", root)
 	dir := filepath.Join(root, "looprig", "jetstream")
 
-	eng, err := Open(EngineOptions{DataDir: dir, SyncInterval: 2 * time.Second})
+	eng, err := OpenEngine(EngineOptions{DataDir: dir, SyncInterval: 2 * time.Second})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -41,7 +41,7 @@ func TestEngineLifecycle(t *testing.T) {
 	}
 
 	// Restart: a fresh engine on the SAME StoreDir must see the persisted stream + message.
-	eng2, err := Open(EngineOptions{DataDir: dir, SyncInterval: 2 * time.Second})
+	eng2, err := OpenEngine(EngineOptions{DataDir: dir, SyncInterval: 2 * time.Second})
 	if err != nil {
 		t.Fatalf("Open (restart): %v", err)
 	}
@@ -59,7 +59,7 @@ func TestEngineLifecycle(t *testing.T) {
 // TestOpenRejectsBadStoreDir proves Open fails closed with a typed error when the
 // StoreDir cannot be resolved (it does not silently fall back to an unconfined path).
 func TestOpenRejectsBadStoreDir(t *testing.T) {
-	if _, err := Open(EngineOptions{DataDir: "", SyncInterval: time.Second}); err == nil {
+	if _, err := OpenEngine(EngineOptions{DataDir: "", SyncInterval: time.Second}); err == nil {
 		t.Fatal("Open with empty DataDir succeeded, want a typed StoreDirError")
 	}
 }

@@ -32,7 +32,7 @@ func TestLedgerConformance(t *testing.T) {
 	storetest.TestLedger(t, func(t *testing.T) storekit.Ledger {
 		n := counter.Add(1)
 		dir := filepath.Join(root, "e"+strconv.FormatUint(n, 10), "jetstream")
-		eng, err := Open(EngineOptions{DataDir: dir, SyncInterval: 50 * time.Millisecond})
+		eng, err := OpenEngine(EngineOptions{DataDir: dir, SyncInterval: 50 * time.Millisecond})
 		if err != nil {
 			t.Fatalf("Open engine: %v", err)
 		}
@@ -49,7 +49,7 @@ func newLeaserBackend(t *testing.T, root string, counter *atomic.Uint64, ttl tim
 	t.Helper()
 	n := counter.Add(1)
 	dir := filepath.Join(root, "l"+strconv.FormatUint(n, 10), "jetstream")
-	eng, err := Open(EngineOptions{DataDir: dir, SyncInterval: 50 * time.Millisecond})
+	eng, err := OpenEngine(EngineOptions{DataDir: dir, SyncInterval: 50 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("Open engine: %v", err)
 	}
@@ -76,7 +76,7 @@ func newKVBackend(t *testing.T, root string, counter *atomic.Uint64) *kvStore {
 	t.Helper()
 	n := counter.Add(1)
 	dir := filepath.Join(root, "kv"+strconv.FormatUint(n, 10), "jetstream")
-	eng, err := Open(EngineOptions{DataDir: dir, SyncInterval: 50 * time.Millisecond})
+	eng, err := OpenEngine(EngineOptions{DataDir: dir, SyncInterval: 50 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("Open engine: %v", err)
 	}
@@ -119,7 +119,7 @@ func newBlobsBackend(t *testing.T, root string, counter *atomic.Uint64) *blobSto
 	t.Helper()
 	n := counter.Add(1)
 	dir := filepath.Join(root, "ob"+strconv.FormatUint(n, 10), "jetstream")
-	eng, err := Open(EngineOptions{DataDir: dir, SyncInterval: 50 * time.Millisecond})
+	eng, err := OpenEngine(EngineOptions{DataDir: dir, SyncInterval: 50 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("Open engine: %v", err)
 	}

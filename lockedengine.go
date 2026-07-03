@@ -23,7 +23,7 @@ var acquireLock = acquireStoreLock
 
 // openEngine is the engine-construction seam. Production opens a real embedded engine;
 // tests swap it to avoid starting NATS.
-var openEngine = func(opts EngineOptions) (engineHandle, error) { return Open(opts) }
+var openEngine = func(opts EngineOptions) (engineHandle, error) { return OpenEngine(opts) }
 
 // LockedEngine is one embedded engine bound to a single StoreDir and guarded by a
 // process-exclusive lock. It is the per-directory unit a consumer opens and closes; the

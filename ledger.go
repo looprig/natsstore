@@ -208,10 +208,17 @@ func isWrongLastSequence(err error) bool {
 // reported-failure-that-actually-committed self-heals (the caller simply appends after
 // the record it did not know had landed).
 //
-// This three-sentinel set is scoped to the IN-PROCESS embedded transport (no network,
-// no reconnect). A remote NATS URL backend would widen the lost-ack surface —
-// ErrConnectionClosed / ErrReconnecting / a drain timeout, plus cancel-after-send — so
-// this classification must be revisited if/when a remote backend is added (D5).
+// This three-sentinel set is tuned for the IN-PROCESS embedded transport (no network,
+// no reconnect), where these are the whole lost-ack surface. A remote NATS URL backend
+// (now supported — natsstore.Open accepts a URL) widens that surface —
+// ErrConnectionClosed / ErrReconnecting / a drain timeout, plus cancel-after-send — but
+// for v1 those wider remote lost-ack outcomes are DELIBERATELY left out of this set and
+// so fall through to a definite error: fail-closed is safe here because a caller that
+// re-observes the CAS-guarded, contiguous tip on restart self-heals a
+// reported-failure-that-actually-committed (it simply appends after the record it did not
+// know had landed), exactly as the context.Canceled note above. Widening the set to
+// classify those remote outcomes as *AmbiguousError (so AppendDefinite resolves them in
+// band, without a restart) is a possible future refinement, not a correctness gap.
 func isAmbiguous(err error) bool {
 	return errors.Is(err, context.DeadlineExceeded) ||
 		errors.Is(err, nats.ErrTimeout) ||
