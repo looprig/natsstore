@@ -67,6 +67,50 @@ func newLeaserBackend(t *testing.T, root string, counter *atomic.Uint64, ttl tim
 	return newLeaserStore(newJetStreamKVSeam(kv), ttl, time.Now)
 }
 
+// newKVBackend stands up a fresh embedded engine on its own StoreDir, provisions a KV
+// bucket over it, and returns a kvStore over the production KV-store seam. Each call is
+// fully isolated (its own engine + bucket), so conformance subtests never collide on one
+// bucket and every revision counts from 1 — the suite asserts the first create returns
+// rev 1. The bucket is DISTINCT from the lease bucket.
+func newKVBackend(t *testing.T, root string, counter *atomic.Uint64) *kvStore {
+	t.Helper()
+	n := counter.Add(1)
+	dir := filepath.Join(root, "kv"+strconv.FormatUint(n, 10), "jetstream")
+	eng, err := Open(EngineOptions{DataDir: dir, SyncInterval: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("Open engine: %v", err)
+	}
+	t.Cleanup(func() { _ = eng.Close() })
+	js, err := jetstream.New(eng.Conn())
+	if err != nil {
+		t.Fatalf("jetstream.New: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	kv, err := js.CreateKeyValue(ctx, kvBucketConfig("looprig_kv"))
+	if err != nil {
+		t.Fatalf("CreateKeyValue: %v", err)
+	}
+	return newKVStore(newJetStreamKVStoreSeam(kv))
+}
+
+// TestKVConformance runs the full storekit KV conformance suite against the JetStream-KV-
+// backed store over an embedded, in-process engine (no network). Every factory call gets
+// a FRESH engine + bucket on its own StoreDir, so each subtest is isolated, revisions
+// start at 1, and the store sees the caller's real, unmangled keys (the suite asserts on
+// KeyNotFoundError.Key / ConflictError.Name / InvalidNameError.Name). It exercises the
+// 1 MiB value floor, revision-CAS conflicts leaving state unchanged, and sorted+deduped
+// prefix listings.
+func TestKVConformance(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", root)
+	var counter atomic.Uint64
+
+	storetest.TestKV(t, func(t *testing.T) storekit.KV {
+		return newKVBackend(t, root, &counter)
+	})
+}
+
 // TestLeaserConformance runs the full storekit Leaser conformance suite against the
 // JetStream-KV-backed leaser over an embedded, in-process engine (no network). Every
 // factory call gets a FRESH engine + bucket on its own StoreDir, so each subtest is

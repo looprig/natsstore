@@ -181,6 +181,58 @@ func (s *jetStreamKVSeam) update(ctx context.Context, key string, val []byte, ex
 	return rev, nil
 }
 
+// jetStreamKVStoreSeam is the production kvSeam: it binds the KV store's five operations
+// to a real, context-aware jetstream.KeyValue bucket (DISTINCT from the lease bucket). It
+// embeds jetStreamKVSeam to reuse the identical create/get/update translation the leaser
+// already validated against the embedded server — the CAS mapping is written once — and
+// adds the two ops the leaser has no use for: del (idempotent) and keys (list-all). It is
+// the ONLY kv-store code that talks to NATS directly.
+type jetStreamKVStoreSeam struct {
+	*jetStreamKVSeam
+}
+
+var _ kvSeam = (*jetStreamKVStoreSeam)(nil)
+
+// newJetStreamKVStoreSeam wraps kv as a production KV-store seam.
+func newJetStreamKVStoreSeam(kv jetstream.KeyValue) *jetStreamKVStoreSeam {
+	return &jetStreamKVStoreSeam{jetStreamKVSeam: newJetStreamKVSeam(kv)}
+}
+
+// del places a delete marker at key, bounded by ctx. JetStream KV's delete is
+// unconditional (no revision fence here), so deleting an absent key still succeeds —
+// exactly the idempotent contract the store relies on.
+func (s *jetStreamKVStoreSeam) del(ctx context.Context, key string) error {
+	return s.kv.Delete(ctx, key)
+}
+
+// keys returns every live key in the bucket, bounded by ctx. An empty bucket surfaces as
+// jetstream.ErrNoKeysFound, which is mapped to an empty slice (absent == empty), not an
+// error; the store sorts/dedups/prefix-filters the result.
+func (s *jetStreamKVStoreSeam) keys(ctx context.Context) ([]string, error) {
+	ks, err := s.kv.Keys(ctx)
+	if err != nil {
+		if errors.Is(err, jetstream.ErrNoKeysFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return ks, nil
+}
+
+// kvBucketConfig returns the jetstream KV bucket configuration for the KV store's bucket:
+// file storage, one replica (single-node embedded), and History 1 (the KV store is a
+// pure revision-CAS latest-value store — no historical values are read). MaxValueSize is
+// left at the default (unlimited, bounded only by the connection's MaxPayload), so the
+// storekit 1 MiB value floor round-trips. It is DISTINCT from leaseBucketConfig's bucket.
+func kvBucketConfig(bucket string) jetstream.KeyValueConfig {
+	return jetstream.KeyValueConfig{
+		Bucket:   bucket,
+		Storage:  jetstream.FileStorage,
+		History:  1,
+		Replicas: 1,
+	}
+}
+
 // isJetStreamWrongLastSeq reports whether err is the jetstream package's
 // expected-last-sequence rejection: a *jetstream.APIError carrying
 // JSErrCodeStreamWrongLastSequence (10071). It is the jetstream-package analogue of
