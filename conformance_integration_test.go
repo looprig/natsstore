@@ -3,6 +3,8 @@
 package natsstore
 
 import (
+	"context"
+	"errors"
 	"path/filepath"
 	"strconv"
 	"sync/atomic"
@@ -11,6 +13,7 @@ import (
 
 	"github.com/ciram-co/storekit"
 	"github.com/ciram-co/storekit/storetest"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 // TestLedgerConformance runs the full storekit ledger conformance suite against the
@@ -36,4 +39,102 @@ func TestLedgerConformance(t *testing.T) {
 		t.Cleanup(func() { _ = eng.Close() })
 		return newLedgerStore(newJetStreamSeam(eng.JetStream()))
 	})
+}
+
+// newLeaserBackend stands up a fresh embedded engine on its own StoreDir, provisions a
+// lease KV bucket over it, and returns a leaserStore over the production KV seam at the
+// given application TTL. Each call is fully isolated (its own engine + bucket), so
+// conformance subtests never collide on one bucket.
+func newLeaserBackend(t *testing.T, root string, counter *atomic.Uint64, ttl time.Duration) *leaserStore {
+	t.Helper()
+	n := counter.Add(1)
+	dir := filepath.Join(root, "l"+strconv.FormatUint(n, 10), "jetstream")
+	eng, err := Open(EngineOptions{DataDir: dir, SyncInterval: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("Open engine: %v", err)
+	}
+	t.Cleanup(func() { _ = eng.Close() })
+	js, err := jetstream.New(eng.Conn())
+	if err != nil {
+		t.Fatalf("jetstream.New: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	kv, err := js.CreateKeyValue(ctx, leaseBucketConfig("looprig_leases", ttl))
+	if err != nil {
+		t.Fatalf("CreateKeyValue: %v", err)
+	}
+	return newLeaserStore(newJetStreamKVSeam(kv), ttl, time.Now)
+}
+
+// TestLeaserConformance runs the full storekit Leaser conformance suite against the
+// JetStream-KV-backed leaser over an embedded, in-process engine (no network). Every
+// factory call gets a FRESH engine + bucket on its own StoreDir, so each subtest is
+// isolated and the leaser sees the caller's real, unmangled names (the suite asserts on
+// LeaseHeldError.Name / InvalidNameError.Name). The default lease TTL is used: it is far
+// longer than a suite run, so no heartbeat fires mid-test and Release drives every
+// re-acquire.
+func TestLeaserConformance(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", root)
+	var counter atomic.Uint64
+
+	storetest.TestLeaser(t, func(t *testing.T) storekit.Leaser {
+		return newLeaserBackend(t, root, &counter, defaultLeaseTTL)
+	})
+}
+
+// TestLeaserReclaimAfterTTLExpiry is the natsstore-specific per-host liveness proof: a
+// holder that dies (its heartbeat stops) without releasing leaves an entry that ages
+// past its application-level ExpiresAt, after which a fresh Acquire reclaims the name at
+// a strictly higher epoch. It uses a short TTL and real wall-clock (production wires
+// time.Now — there is no injected clock on the public Leaser), simulating death by
+// stopping A's heartbeat, then waiting past the TTL.
+func TestLeaserReclaimAfterTTLExpiry(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", root)
+	var counter atomic.Uint64
+
+	const shortTTL = 200 * time.Millisecond
+	le := newLeaserBackend(t, root, &counter, shortTTL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	const name = "sessions/reclaim"
+	a, err := le.Acquire(ctx, name)
+	if err != nil {
+		t.Fatalf("Acquire A: %v", err)
+	}
+	epochA := a.Epoch()
+
+	// Simulate A's death: stop its heartbeat so ExpiresAt is no longer renewed, WITHOUT
+	// releasing (a released lease would relinquish the entry cleanly — that is not death).
+	a.(*kvLease).stopHeartbeatForTest()
+
+	// Wait comfortably past the TTL so the stored ExpiresAt reads expired.
+	time.Sleep(shortTTL * 3)
+
+	b, err := le.Acquire(ctx, name)
+	if err != nil {
+		t.Fatalf("Acquire B after TTL expiry: %v", err)
+	}
+	defer func() { _ = b.Release(ctx) }()
+	if b.Epoch() <= epochA {
+		t.Errorf("reclaimed epoch = %d, want strictly > dead holder's epoch %d", b.Epoch(), epochA)
+	}
+
+	// Sanity: the reclaimed lease is live (Lost open) and re-holds the name — a second
+	// Acquire while B holds must now be refused.
+	if isChanClosed(b.Lost()) {
+		t.Error("reclaimed lease B.Lost() is closed, want open (live)")
+	}
+	_, err = le.Acquire(ctx, name)
+	var held *storekit.LeaseHeldError
+	if !errors.As(err, &held) {
+		t.Fatalf("Acquire while B holds = %v, want *LeaseHeldError", err)
+	}
+	if held.HolderEpoch != b.Epoch() {
+		t.Errorf("LeaseHeldError.HolderEpoch = %d, want %d", held.HolderEpoch, b.Epoch())
+	}
 }

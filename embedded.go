@@ -233,6 +233,12 @@ func containmentRoot() (string, error) {
 // until Close.
 func (e *Engine) JetStream() nats.JetStreamContext { return e.js }
 
+// Conn returns the in-process client connection. It is the handle a caller uses to
+// build the context-aware jetstream.JetStream (jetstream.New) that the lease KV seam
+// needs — the legacy JetStreamContext above cannot carry a per-call context. It is
+// valid until Close.
+func (e *Engine) Conn() *nats.Conn { return e.nc }
+
 // Close drains the client connection and shuts the embedded server down cleanly,
 // flushing JetStream state to the StoreDir. It is best-effort and safe to call once at
 // exit; a drain error is returned but the server is always shut down.
