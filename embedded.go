@@ -39,6 +39,14 @@ const (
 	// readyTimeout bounds how long Open waits for the embedded server to accept
 	// connections before failing closed.
 	readyTimeout = 10 * time.Second
+	// maxPayload is the connection-level maximum message size the embedded server
+	// accepts. The nats-server default is exactly 1 MB (1048576 bytes), but every
+	// storekit backend must accept a 1 MiB (1<<20) ledger payload — and JetStream
+	// adds subject + header framing on top — so the default would reject a
+	// floor-sized append. This is set comfortably above the ledger stream's own
+	// 4 MiB per-message ceiling (ledgerMaxMsgSize) so the stream cap, not the
+	// connection, is the effective per-record limit.
+	maxPayload int32 = 8 << 20
 )
 
 // StoreDirError reports that the embedded server's StoreDir could not be resolved or
@@ -178,10 +186,11 @@ func Open(opts EngineOptions) (*Engine, error) {
 	srv, err := server.NewServer(&server.Options{
 		JetStream:    true,
 		StoreDir:     storeDir,
-		DontListen:   true, // in-process only — no TCP socket
-		SyncInterval: sync, // explicit power-loss durability knob
-		NoSigs:       true, // the consumer owns signal handling; the server must not install handlers
-		NoLog:        true, // server logs would corrupt a TUI's stdout/scrollback
+		DontListen:   true,       // in-process only — no TCP socket
+		SyncInterval: sync,       // explicit power-loss durability knob
+		MaxPayload:   maxPayload, // accept the storekit 1 MiB payload floor + JetStream framing (default is 1 MB)
+		NoSigs:       true,       // the consumer owns signal handling; the server must not install handlers
+		NoLog:        true,       // server logs would corrupt a TUI's stdout/scrollback
 	})
 	if err != nil {
 		return nil, &ServerStartError{Cause: err}
