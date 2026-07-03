@@ -15,7 +15,7 @@ Sanctioned in this module (and nowhere else in the tree):
 - `github.com/nats-io/nats-server/v2` — the embedded in-process JetStream server (the
   `DontListen` engine; no TCP). Pulls in `nats-io/jwt`, `nats-io/nkeys`, `nats-io/nuid` as
   indirect deps.
-- `github.com/ciram-co/storekit` — the storage contracts this module implements (local
+- `github.com/looprig/storekit` — the storage contracts this module implements (local
   `replace => ../storekit`).
 - Otherwise **stdlib only**. Any further third-party dependency requires explicit approval;
   reach for the standard library first.

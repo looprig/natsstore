@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ciram-co/storekit"
+	"github.com/looprig/storekit"
 )
 
 // TestOpenEmbeddedRoundtrip is the public-entry-point end-to-end proof: Open on a PLAIN

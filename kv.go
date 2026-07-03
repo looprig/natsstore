@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/ciram-co/storekit"
+	"github.com/looprig/storekit"
 )
 
 // kvSeam is the narrow set of JetStream KV operations kvStore drives, isolated behind

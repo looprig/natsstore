@@ -7,7 +7,7 @@ import (
 	"io"
 	"testing"
 
-	"github.com/ciram-co/storekit"
+	"github.com/looprig/storekit"
 	"github.com/nats-io/nats.go"
 )
 

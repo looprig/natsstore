@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ciram-co/storekit"
+	"github.com/looprig/storekit"
 )
 
 // defaultLeaseTTL is the application-level lease validity window: an entry whose

@@ -4,7 +4,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/ciram-co/storekit"
+	"github.com/looprig/storekit"
 )
 
 // A storekit name is '/'-joined segments over [a-z0-9][a-z0-9_.-]*, so it only

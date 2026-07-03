@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ciram-co/storekit"
+	"github.com/looprig/storekit"
 )
 
 // fakeKVSeam is a stateful, in-memory kvLeaseSeam for unit-testing leaserStore with
