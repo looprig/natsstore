@@ -8,7 +8,7 @@ import (
 	"io"
 	"strconv"
 
-	"github.com/looprig/storekit"
+	"github.com/looprig/storage"
 )
 
 // objSeam is the narrow set of JetStream ObjectStore operations blobStore drives,

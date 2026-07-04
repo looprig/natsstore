@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/looprig/storekit"
-	"github.com/looprig/storekit/storetest"
+	"github.com/looprig/storage"
+	"github.com/looprig/storage/storetest"
 	"github.com/nats-io/nats.go/jetstream"
 )
 

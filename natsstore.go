@@ -31,7 +31,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/looprig/storekit"
+	"github.com/looprig/storage"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )

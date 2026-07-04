@@ -9,7 +9,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/looprig/storekit"
+	"github.com/looprig/storage"
 )
 
 // fakeObjSeam is a stateful, in-memory objSeam for unit-testing blobStore with no running

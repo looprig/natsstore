@@ -6,7 +6,7 @@ import (
 	"io"
 	"strconv"
 
-	"github.com/looprig/storekit"
+	"github.com/looprig/storage"
 	"github.com/nats-io/nats.go"
 )
 

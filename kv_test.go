@@ -8,7 +8,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/looprig/storekit"
+	"github.com/looprig/storage"
 )
 
 // fakeKVStoreSeam is a stateful, in-memory kvSeam for unit-testing kvStore with no

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/looprig/storekit"
+	"github.com/looprig/storage"
 )
 
 // TestSubjectForNameVectors pins the JetStream-subject encoding against explicit
