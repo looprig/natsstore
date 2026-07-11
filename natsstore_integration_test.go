@@ -160,7 +160,7 @@ func exerciseLeaser(ctx context.Context, t *testing.T, st *Store) {
 	if lease.Epoch() < 1 {
 		t.Errorf("lease epoch = %d, want >= 1", lease.Epoch())
 	}
-	if _, err := st.Leaser.Acquire(ctx, name); !errors.As(err, new(*storekit.LeaseHeldError)) {
+	if _, err := st.Leaser.Acquire(ctx, name); !errors.As(err, new(*storage.LeaseHeldError)) {
 		t.Errorf("second Acquire while held = %v, want *LeaseHeldError", err)
 	}
 	if err := lease.Release(ctx); err != nil {

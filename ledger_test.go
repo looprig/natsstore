@@ -71,13 +71,13 @@ func (f *fakeSeam) deleteStream(_ context.Context, _ string) error {
 	return f.deleteErr
 }
 
-// assertAmbiguous fails unless err is a *storekit.AmbiguousError naming the given
+// assertAmbiguous fails unless err is a *storage.AmbiguousError naming the given
 // name/expected and wrapping cause (both on .Cause and via errors.Is on err).
 func assertAmbiguous(t *testing.T, err error, name string, expected uint64, cause error) {
 	t.Helper()
-	var ae *storekit.AmbiguousError
+	var ae *storage.AmbiguousError
 	if !errors.As(err, &ae) {
-		t.Fatalf("Append = %v, want *storekit.AmbiguousError", err)
+		t.Fatalf("Append = %v, want *storage.AmbiguousError", err)
 	}
 	if ae.Name != name || ae.Expected != expected {
 		t.Errorf("AmbiguousError = {Name:%q, Expected:%d}, want {%q, %d}", ae.Name, ae.Expected, name, expected)
@@ -115,9 +115,9 @@ func TestLedgerAppendClassification(t *testing.T) {
 			name:       "wrong-last-sequence maps to ConflictError",
 			publishErr: &nats.APIError{ErrorCode: nats.JSErrCodeStreamWrongLastSequence, Code: 400},
 			check: func(t *testing.T, err error) {
-				var ce *storekit.ConflictError
+				var ce *storage.ConflictError
 				if !errors.As(err, &ce) {
-					t.Fatalf("Append = %v, want *storekit.ConflictError", err)
+					t.Fatalf("Append = %v, want *storage.ConflictError", err)
 				}
 				if ce.Name != name || ce.Expected != expected {
 					t.Errorf("ConflictError = {Name:%q, Expected:%d}, want {%q, %d}", ce.Name, ce.Expected, name, expected)
@@ -146,8 +146,8 @@ func TestLedgerAppendClassification(t *testing.T) {
 				if !errors.Is(err, otherErr) {
 					t.Fatalf("Append = %v, want the raw publish error %v", err, otherErr)
 				}
-				var ce *storekit.ConflictError
-				var ae *storekit.AmbiguousError
+				var ce *storage.ConflictError
+				var ae *storage.AmbiguousError
 				if errors.As(err, &ce) || errors.As(err, &ae) {
 					t.Errorf("Append mis-classified a definite error as Conflict/Ambiguous: %v", err)
 				}
@@ -164,8 +164,8 @@ func TestLedgerAppendClassification(t *testing.T) {
 				if !errors.Is(err, context.Canceled) {
 					t.Fatalf("Append = %v, want context.Canceled surfaced verbatim", err)
 				}
-				var ce *storekit.ConflictError
-				var ae *storekit.AmbiguousError
+				var ce *storage.ConflictError
+				var ae *storage.AmbiguousError
 				if errors.As(err, &ce) || errors.As(err, &ae) {
 					t.Errorf("Append mis-classified context.Canceled as Conflict/Ambiguous: %v", err)
 				}
@@ -183,7 +183,7 @@ func TestLedgerAppendClassification(t *testing.T) {
 			tt.check(t, err)
 
 			// Regardless of outcome the ledger ensures the stream once and publishes
-			// EXACTLY once — it must never retry (storekit.AppendDefinite owns
+			// EXACTLY once — it must never retry (storage.AppendDefinite owns
 			// ambiguity resolution, not the backend).
 			if f.ensureCalls != 1 {
 				t.Errorf("ensureStream calls = %d, want 1", f.ensureCalls)
@@ -219,9 +219,9 @@ func TestLedgerAppendInvalidName(t *testing.T) {
 			l := newLedgerStore(f)
 
 			err := l.Append(context.Background(), bad.value, 0, []byte("x"))
-			var ine *storekit.InvalidNameError
+			var ine *storage.InvalidNameError
 			if !errors.As(err, &ine) {
-				t.Fatalf("Append(%q) = %v, want *storekit.InvalidNameError", bad.value, err)
+				t.Fatalf("Append(%q) = %v, want *storage.InvalidNameError", bad.value, err)
 			}
 			if ine.Name != bad.value {
 				t.Errorf("InvalidNameError.Name = %q, want %q", ine.Name, bad.value)
@@ -322,9 +322,9 @@ func TestLedgerReadInvalidName(t *testing.T) {
 	f := &fakeSeam{}
 	l := newLedgerStore(f)
 	_, err := l.Read(context.Background(), "Bad Name", 1)
-	var ine *storekit.InvalidNameError
+	var ine *storage.InvalidNameError
 	if !errors.As(err, &ine) {
-		t.Fatalf("Read(invalid) = %v, want *storekit.InvalidNameError", err)
+		t.Fatalf("Read(invalid) = %v, want *storage.InvalidNameError", err)
 	}
 }
 

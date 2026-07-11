@@ -1,8 +1,8 @@
 # natsstore
 
-`natsstore` implements [`storekit`](../storekit)'s four storage primitives — `Ledger`,
+`natsstore` implements [`storage`](../storage)'s four storage primitives — `Ledger`,
 `Leaser`, `KV`, and `Blobs` — over **NATS JetStream**. It is the only module in the tree
-that depends on the NATS packages; consumers depend on the neutral `storekit` contracts and
+that depends on the NATS packages; consumers depend on the neutral `storage` contracts and
 wire `natsstore` in at their composition root.
 
 A `natsstore.Store` runs over one of two backends, chosen at `Open`:
@@ -36,7 +36,7 @@ defer st.Close(ctx)
 sess, err := sessionstore.Open(ctx, st.Composite) // or st.Backend()
 ```
 
-`Store` embeds `*storekit.Composite`, so each primitive is reachable as a promoted field
+`Store` embeds `*storage.Composite`, so each primitive is reachable as a promoted field
 (`st.Ledger`, `st.Leaser`, `st.KV`, `st.Blobs`); the whole bundle is `st.Composite` (or
 `st.Backend()`). `Close` drains the connection and — in embedded mode — shuts the in-process
 server down afterwards; it is idempotent.
@@ -52,4 +52,4 @@ data rather than failing.
 
 The NATS dependencies are sanctioned **only in this module** (`github.com/nats-io/nats.go`
 for the JetStream client, `github.com/nats-io/nats-server/v2` for the embedded in-process
-server). Everything else is stdlib plus the local `storekit` contracts. See `CLAUDE.md`.
+server). Everything else is stdlib plus the local `storage` contracts. See `CLAUDE.md`.

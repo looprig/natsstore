@@ -67,7 +67,7 @@ var (
 // (get / create / update / decode) that is NOT one of the expected CAS outcomes — an
 // ambiguous or malformed read, or a backend fault. It fails closed: an ambiguous read
 // never silently grants ownership. It names the lease, the operation, and unwraps to
-// the underlying cause. (The storekit taxonomy has no read-error type — LeaseHeldError
+// the underlying cause. (The storage taxonomy has no read-error type — LeaseHeldError
 // and LeaseLostError are the only lease errors it defines — so this is a
 // natsstore-specific typed error, analogous to StreamOpError.)
 type LeaseOpError struct {
@@ -99,7 +99,7 @@ type leaseRecord struct {
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
-// leaserStore implements storekit.Leaser over one JetStream KV bucket, one entry per
+// leaserStore implements storage.Leaser over one JetStream KV bucket, one entry per
 // name keyed by leaseKeyForName(name). Acquire fences a monotonically increasing epoch
 // via CAS so only one holder wins and every new owner out-ranks every prior one. It
 // holds only the seam (DIP), the TTL, and the clock; it carries no per-name mutable
@@ -110,7 +110,7 @@ type leaserStore struct {
 	now  leaseClock
 }
 
-var _ storekit.Leaser = (*leaserStore)(nil)
+var _ storage.Leaser = (*leaserStore)(nil)
 
 // newLeaserStore builds a leaser over seam with the given application-level TTL and
 // clock. A non-positive ttl falls back to defaultLeaseTTL; a nil clock falls back to
@@ -138,10 +138,10 @@ func newLeaserStore(seam kvLeaseSeam, ttl time.Duration, now leaseClock) *leaser
 // is monotonic across acquisitions because each takeover writes prev+1 and Release
 // preserves the epoch; only one holder wins a race because create / update(rev) is
 // atomic. An ambiguous read fails closed with *LeaseOpError — it never grants.
-func (s *leaserStore) Acquire(ctx context.Context, name string) (storekit.Lease, error) {
+func (s *leaserStore) Acquire(ctx context.Context, name string) (storage.Lease, error) {
 	key, err := leaseKeyForName(name)
 	if err != nil {
-		return nil, err // *storekit.InvalidNameError, verbatim
+		return nil, err // *storage.InvalidNameError, verbatim
 	}
 	holder, err := newHolderID()
 	if err != nil {
@@ -161,7 +161,7 @@ func (s *leaserStore) Acquire(ctx context.Context, name string) (storekit.Lease,
 		return nil, &LeaseOpError{Name: name, Op: "decode", Cause: derr}
 	}
 	if !s.expired(rec) {
-		return nil, &storekit.LeaseHeldError{Name: name, HolderEpoch: rec.Epoch}
+		return nil, &storage.LeaseHeldError{Name: name, HolderEpoch: rec.Epoch}
 	}
 	return s.updateLease(ctx, name, key, holder, rec.Epoch+1, rev)
 }
@@ -169,7 +169,7 @@ func (s *leaserStore) Acquire(ctx context.Context, name string) (storekit.Lease,
 // createLease CAS-creates a fresh entry at epoch and, on success, returns a started
 // lease. A losing create (errKVKeyExists) means a concurrent acquirer won the race →
 // *LeaseHeldError.
-func (s *leaserStore) createLease(ctx context.Context, name, key, holder string, epoch uint64) (storekit.Lease, error) {
+func (s *leaserStore) createLease(ctx context.Context, name, key, holder string, epoch uint64) (storage.Lease, error) {
 	val, expiresAt, err := s.encode(epoch, holder)
 	if err != nil {
 		return nil, &LeaseOpError{Name: name, Op: "encode", Cause: err}
@@ -177,7 +177,7 @@ func (s *leaserStore) createLease(ctx context.Context, name, key, holder string,
 	rev, err := s.seam.create(ctx, key, val)
 	if err != nil {
 		if errors.Is(err, errKVKeyExists) {
-			return nil, &storekit.LeaseHeldError{Name: name, HolderEpoch: epoch}
+			return nil, &storage.LeaseHeldError{Name: name, HolderEpoch: epoch}
 		}
 		return nil, &LeaseOpError{Name: name, Op: "create", Cause: err}
 	}
@@ -188,7 +188,7 @@ func (s *leaserStore) createLease(ctx context.Context, name, key, holder string,
 // success, returns a started lease. A losing update (errKVCASConflict / not-found)
 // means a concurrent acquirer or a stale holder's renew moved the revision →
 // *LeaseHeldError naming the epoch that beat us (epoch-1).
-func (s *leaserStore) updateLease(ctx context.Context, name, key, holder string, epoch, lastRev uint64) (storekit.Lease, error) {
+func (s *leaserStore) updateLease(ctx context.Context, name, key, holder string, epoch, lastRev uint64) (storage.Lease, error) {
 	val, expiresAt, err := s.encode(epoch, holder)
 	if err != nil {
 		return nil, &LeaseOpError{Name: name, Op: "encode", Cause: err}
@@ -196,7 +196,7 @@ func (s *leaserStore) updateLease(ctx context.Context, name, key, holder string,
 	rev, err := s.seam.update(ctx, key, val, lastRev)
 	if err != nil {
 		if errors.Is(err, errKVCASConflict) || errors.Is(err, errKVKeyNotFound) {
-			return nil, &storekit.LeaseHeldError{Name: name, HolderEpoch: epoch - 1}
+			return nil, &storage.LeaseHeldError{Name: name, HolderEpoch: epoch - 1}
 		}
 		return nil, &LeaseOpError{Name: name, Op: "update", Cause: err}
 	}
@@ -239,7 +239,7 @@ func (s *leaserStore) start(name, key, holder string, epoch, rev uint64, validUn
 	return l
 }
 
-// kvLease is the concrete storekit.Lease: a single holder of a name's KV lease entry.
+// kvLease is the concrete storage.Lease: a single holder of a name's KV lease entry.
 // It heartbeats its ExpiresAt forward on a background goroutine via CAS on its own
 // revision; a failed renew (a higher epoch / different holder took the entry, or it
 // vanished) closes Lost(). epoch is immutable (a takeover is a loss, not an epoch
@@ -267,7 +267,7 @@ type kvLease struct {
 	wg       sync.WaitGroup
 }
 
-var _ storekit.Lease = (*kvLease)(nil)
+var _ storage.Lease = (*kvLease)(nil)
 
 // Epoch returns the fencing epoch this lease holds. It is fixed at construction.
 func (l *kvLease) Epoch() uint64 { return l.epoch }
@@ -399,10 +399,10 @@ func (l *kvLease) renew(ctx context.Context) bool {
 	return true
 }
 
-// leaseKeyForName maps a storekit name to its KV key, reusing the D2 stream escaping so
+// leaseKeyForName maps a storage name to its KV key, reusing the D2 stream escaping so
 // the key is a single flat JetStream-safe token in [a-z0-9_-] (no '.' — which a KV key
 // otherwise turns into subject hierarchy — and no '/'). It returns the
-// *storekit.InvalidNameError verbatim for an invalid name, so Acquire validates and
+// *storage.InvalidNameError verbatim for an invalid name, so Acquire validates and
 // escapes in one call.
 func leaseKeyForName(name string) (string, error) {
 	return streamForName(name)

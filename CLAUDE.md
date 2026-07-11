@@ -1,6 +1,6 @@
 # CLAUDE.md — natsstore
 
-`natsstore` implements [`storekit`](../storekit)'s storage primitives (`Ledger`, `Leaser`,
+`natsstore` implements [`storage`](../storage)'s storage primitives (`Ledger`, `Leaser`,
 `KV`, `Blobs`) over **NATS JetStream**, and owns an **embedded, in-process JetStream
 server** (no TCP socket) over a persistent on-disk StoreDir. This is the ONLY module in the
 tree where the NATS dependencies are sanctioned — they moved here from looprig when the
@@ -16,7 +16,7 @@ Sanctioned in this module (and nowhere else in the tree):
   `DontListen` engine; no TCP). Pulls in `nats-io/jwt`, `nats-io/nkeys`, `nats-io/nuid` as
   indirect deps.
 - `github.com/looprig/storage` — the storage contracts this module implements (local
-  `replace => ../storekit`).
+  `replace => ../storage`).
 - Otherwise **stdlib only**. Any further third-party dependency requires explicit approval;
   reach for the standard library first.
 

@@ -198,7 +198,7 @@ func TestStreamAntiCollision(t *testing.T) {
 }
 
 // TestEncodersRejectInvalidName proves both encoders validate first and surface
-// the storekit *InvalidNameError verbatim on a name that breaks the grammar.
+// the storage *InvalidNameError verbatim on a name that breaks the grammar.
 func TestEncodersRejectInvalidName(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -217,12 +217,12 @@ func TestEncodersRejectInvalidName(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			var ine *storekit.InvalidNameError
+			var ine *storage.InvalidNameError
 			if _, err := subjectForName(tt.in); !errors.As(err, &ine) {
-				t.Errorf("subjectForName(%q) error = %T %v, want *storekit.InvalidNameError", tt.in, err, err)
+				t.Errorf("subjectForName(%q) error = %T %v, want *storage.InvalidNameError", tt.in, err, err)
 			}
 			if _, err := streamForName(tt.in); !errors.As(err, &ine) {
-				t.Errorf("streamForName(%q) error = %T %v, want *storekit.InvalidNameError", tt.in, err, err)
+				t.Errorf("streamForName(%q) error = %T %v, want *storage.InvalidNameError", tt.in, err, err)
 			}
 		})
 	}
@@ -231,7 +231,7 @@ func TestEncodersRejectInvalidName(t *testing.T) {
 // streamCharset is the exact byte set a stream name may contain.
 var streamCharset = regexp.MustCompile(`^[a-z0-9_-]+$`)
 
-// TestSubjectRoundTripProperty generates many valid storekit names and proves
+// TestSubjectRoundTripProperty generates many valid storage names and proves
 // nameFromSubject(subjectForName(n)) == n, and that no subject output contains a
 // subject wildcard/space (' ', '*', '>').
 func TestSubjectRoundTripProperty(t *testing.T) {
@@ -242,7 +242,7 @@ func TestSubjectRoundTripProperty(t *testing.T) {
 
 	for i := 0; i < 4000; i++ {
 		n := genValidName(rng)
-		if err := storekit.ValidateName(n); err != nil {
+		if err := storage.ValidateName(n); err != nil {
 			t.Fatalf("generator produced invalid name %q: %v", n, err)
 		}
 		subj, err := subjectForName(n)
@@ -262,7 +262,7 @@ func TestSubjectRoundTripProperty(t *testing.T) {
 	}
 }
 
-// TestStreamRoundTripProperty generates many valid storekit names and proves
+// TestStreamRoundTripProperty generates many valid storage names and proves
 // nameFromStream(streamForName(n)) == n, and that every stream output matches
 // ^[a-z0-9_-]+$.
 func TestStreamRoundTripProperty(t *testing.T) {
@@ -273,7 +273,7 @@ func TestStreamRoundTripProperty(t *testing.T) {
 
 	for i := 0; i < 4000; i++ {
 		n := genValidName(rng)
-		if err := storekit.ValidateName(n); err != nil {
+		if err := storage.ValidateName(n); err != nil {
 			t.Fatalf("generator produced invalid name %q: %v", n, err)
 		}
 		stream, err := streamForName(n)
@@ -293,7 +293,7 @@ func TestStreamRoundTripProperty(t *testing.T) {
 	}
 }
 
-// genValidName builds a random name that satisfies storekit.ValidateName: 1..4
+// genValidName builds a random name that satisfies storage.ValidateName: 1..4
 // segments joined by '/', each segment starting with [a-z0-9] and continuing
 // with [a-z0-9_.-]. The alphabets over-sample '.', '_' and '-' to stress the
 // escape paths.

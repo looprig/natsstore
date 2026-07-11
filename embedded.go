@@ -1,4 +1,4 @@
-// Package natsstore implements storekit's storage primitives over NATS JetStream and owns
+// Package natsstore implements storage's storage primitives over NATS JetStream and owns
 // an embedded, in-process JetStream server (no TCP socket) over a persistent on-disk
 // StoreDir, so a single process gets a durable JetStream backend with no external broker.
 //
@@ -41,7 +41,7 @@ const (
 	readyTimeout = 10 * time.Second
 	// maxPayload is the connection-level maximum message size the embedded server
 	// accepts. The nats-server default is exactly 1 MB (1048576 bytes), but every
-	// storekit backend must accept a 1 MiB (1<<20) ledger payload — and JetStream
+	// storage backend must accept a 1 MiB (1<<20) ledger payload — and JetStream
 	// adds subject + header framing on top — so the default would reject a
 	// floor-sized append. This is set comfortably above the ledger stream's own
 	// 4 MiB per-message ceiling (ledgerMaxMsgSize) so the stream cap, not the
@@ -209,7 +209,7 @@ func openEngineAt(storeDir string, sync time.Duration, maxPay int32) (*Engine, e
 		StoreDir:     storeDir,
 		DontListen:   true,   // in-process only — no TCP socket
 		SyncInterval: sync,   // explicit power-loss durability knob
-		MaxPayload:   maxPay, // accept the storekit 1 MiB payload floor + JetStream framing (default is 1 MB)
+		MaxPayload:   maxPay, // accept the storage 1 MiB payload floor + JetStream framing (default is 1 MB)
 		NoSigs:       true,   // the consumer owns signal handling; the server must not install handlers
 		NoLog:        true,   // server logs would corrupt a TUI's stdout/scrollback
 	})

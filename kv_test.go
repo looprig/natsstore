@@ -167,7 +167,7 @@ func TestKVGetAbsentReturnsKeyNotFound(t *testing.T) {
 	const key = "sessions/missing"
 	s := newKVStore(newFakeKVStoreSeam())
 	_, _, err := s.Get(context.Background(), key)
-	var nf *storekit.KeyNotFoundError
+	var nf *storage.KeyNotFoundError
 	if !errors.As(err, &nf) {
 		t.Fatalf("Get(absent) = %v, want *KeyNotFoundError", err)
 	}
@@ -204,7 +204,7 @@ func TestKVPutConflictLeavesStateUnchanged(t *testing.T) {
 			}
 
 			_, err := s.Put(ctx, key, tt.expectedRev, []byte("nope"))
-			var ce *storekit.ConflictError
+			var ce *storage.ConflictError
 			if !errors.As(err, &ce) {
 				t.Fatalf("Put(expectedRev=%d) = %v, want *ConflictError", tt.expectedRev, err)
 			}
@@ -214,7 +214,7 @@ func TestKVPutConflictLeavesStateUnchanged(t *testing.T) {
 			}
 
 			if tt.preRevs == 0 {
-				if _, _, gerr := s.Get(ctx, key); !errors.As(gerr, new(*storekit.KeyNotFoundError)) {
+				if _, _, gerr := s.Get(ctx, key); !errors.As(gerr, new(*storage.KeyNotFoundError)) {
 					t.Errorf("Get after rejected Put = %v, want key still absent", gerr)
 				}
 				return
@@ -314,7 +314,7 @@ func TestKVDeleteIdempotentAndFreesKey(t *testing.T) {
 					t.Fatalf("Delete call %d = %v, want nil (idempotent)", i, err)
 				}
 			}
-			if _, _, err := s.Get(ctx, key); !errors.As(err, new(*storekit.KeyNotFoundError)) {
+			if _, _, err := s.Get(ctx, key); !errors.As(err, new(*storage.KeyNotFoundError)) {
 				t.Errorf("Get after delete = %v, want *KeyNotFoundError", err)
 			}
 			// A deleted key is truly free: a fresh create-only Put succeeds.
@@ -355,7 +355,7 @@ func TestKVInvalidKey(t *testing.T) {
 				f := newFakeKVStoreSeam()
 				s := newKVStore(f)
 				err := m.call(s, bad.value)
-				var ine *storekit.InvalidNameError
+				var ine *storage.InvalidNameError
 				if !errors.As(err, &ine) {
 					t.Fatalf("%s(%q) = %v, want *InvalidNameError", m.method, bad.value, err)
 				}
@@ -401,9 +401,9 @@ func TestKVBackendFaultFailsClosed(t *testing.T) {
 			if !errors.Is(err, boom) {
 				t.Error("KVOpError does not unwrap to the backend cause")
 			}
-			// A backend fault must never be mis-typed as a storekit CAS/absence outcome.
-			if errors.As(err, new(*storekit.ConflictError)) || errors.As(err, new(*storekit.KeyNotFoundError)) {
-				t.Error("backend fault mis-classified as a storekit KV outcome")
+			// A backend fault must never be mis-typed as a storage CAS/absence outcome.
+			if errors.As(err, new(*storage.ConflictError)) || errors.As(err, new(*storage.KeyNotFoundError)) {
+				t.Error("backend fault mis-classified as a storage KV outcome")
 			}
 		})
 	}

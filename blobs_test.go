@@ -202,7 +202,7 @@ func TestBlobsDifferentContentConflictLeavesOriginal(t *testing.T) {
 				t.Fatalf("first Put: %v", err)
 			}
 			err := s.Put(ctx, key, bytes.NewReader(tt.second))
-			var bc *storekit.BlobConflictError
+			var bc *storage.BlobConflictError
 			if !errors.As(err, &bc) {
 				t.Fatalf("re-Put(different) = %v, want *BlobConflictError", err)
 			}
@@ -232,7 +232,7 @@ func TestBlobsGetAbsentReturnsBlobNotFound(t *testing.T) {
 	const key = "blobs/missing"
 	s := newBlobStore(newFakeObjSeam())
 	_, err := s.Get(context.Background(), key)
-	var nf *storekit.BlobNotFoundError
+	var nf *storage.BlobNotFoundError
 	if !errors.As(err, &nf) {
 		t.Fatalf("Get(absent) = %v, want *BlobNotFoundError", err)
 	}
@@ -318,7 +318,7 @@ func TestBlobsDeleteIdempotentAndFreesKey(t *testing.T) {
 					t.Fatalf("Delete call %d = %v, want nil (idempotent)", i, err)
 				}
 			}
-			if _, err := s.Get(ctx, key); !errors.As(err, new(*storekit.BlobNotFoundError)) {
+			if _, err := s.Get(ctx, key); !errors.As(err, new(*storage.BlobNotFoundError)) {
 				t.Errorf("Get after delete = %v, want *BlobNotFoundError", err)
 			}
 			// A deleted key is free: a fresh Put of new content succeeds with no lingering
@@ -360,7 +360,7 @@ func TestBlobsInvalidKey(t *testing.T) {
 				f := newFakeObjSeam()
 				s := newBlobStore(f)
 				err := m.call(s, bad.value)
-				var ine *storekit.InvalidNameError
+				var ine *storage.InvalidNameError
 				if !errors.As(err, &ine) {
 					t.Fatalf("%s(%q) = %v, want *InvalidNameError", m.method, bad.value, err)
 				}
@@ -427,9 +427,9 @@ func TestBlobsBackendFaultFailsClosed(t *testing.T) {
 			if !errors.Is(err, boom) {
 				t.Error("BlobOpError does not unwrap to the backend cause")
 			}
-			// A backend fault must never be mis-typed as a storekit blob outcome.
-			if errors.As(err, new(*storekit.BlobConflictError)) || errors.As(err, new(*storekit.BlobNotFoundError)) {
-				t.Error("backend fault mis-classified as a storekit blob outcome")
+			// A backend fault must never be mis-typed as a storage blob outcome.
+			if errors.As(err, new(*storage.BlobConflictError)) || errors.As(err, new(*storage.BlobNotFoundError)) {
+				t.Error("backend fault mis-classified as a storage blob outcome")
 			}
 		})
 	}

@@ -50,7 +50,7 @@ var errObjNotFound = errors.New("natsstore: object not found")
 // put / get / delete / list / getInfo) that is NOT one of the expected outcomes (absence,
 // content conflict) — a source-reader fault or a backend fault. It fails closed and names
 // the key (or, for list, the prefix), the operation, and unwraps to the underlying cause.
-// (The storekit taxonomy's only blob errors are BlobNotFoundError and BlobConflictError —
+// (The storage taxonomy's only blob errors are BlobNotFoundError and BlobConflictError —
 // neither fits a reader/backend fault — so this is a natsstore-specific typed error.)
 type BlobOpError struct {
 	Key   string
@@ -63,7 +63,7 @@ func (e *BlobOpError) Error() string {
 }
 func (e *BlobOpError) Unwrap() error { return e.Cause }
 
-// blobStore implements storekit.Blobs over one JetStream ObjectStore, one object per key.
+// blobStore implements storage.Blobs over one JetStream ObjectStore, one object per key.
 // It holds only the seam (DIP) and carries no mutable state, so it is as safe for
 // concurrent use as the seam beneath it. Keys map DIRECTLY to ObjectStore object names
 // (see blobKeyForName). Writes are content-addressed and immutable per key: an existing
@@ -73,7 +73,7 @@ type blobStore struct {
 	seam objSeam
 }
 
-var _ storekit.Blobs = (*blobStore)(nil)
+var _ storage.Blobs = (*blobStore)(nil)
 
 // newBlobStore builds a blob store over seam.
 func newBlobStore(seam objSeam) *blobStore {
@@ -85,14 +85,14 @@ func newBlobStore(seam objSeam) *blobStore {
 // object), then:
 //   - object absent            → put the new content.
 //   - object present, identical → no-op success (no rewrite of the stored bytes).
-//   - object present, different → *storekit.BlobConflictError, original left untouched.
+//   - object present, different → *storage.BlobConflictError, original left untouched.
 //
 // A source-reader fault surfaces as a typed *BlobOpError (fail closed) before any backend
 // write is attempted.
 func (s *blobStore) Put(ctx context.Context, key string, r io.Reader) error {
 	k, err := blobKeyForName(key)
 	if err != nil {
-		return err // *storekit.InvalidNameError, verbatim
+		return err // *storage.InvalidNameError, verbatim
 	}
 	data, err := io.ReadAll(r)
 	if err != nil {
@@ -113,21 +113,21 @@ func (s *blobStore) Put(ctx context.Context, key string, r io.Reader) error {
 	if bytes.Equal(existing, sum[:]) {
 		return nil // byte-identical: content-addressed no-op
 	}
-	return &storekit.BlobConflictError{Key: key}
+	return &storage.BlobConflictError{Key: key}
 }
 
-// Get returns an independent reader over the object at key, or *storekit.BlobNotFoundError
+// Get returns an independent reader over the object at key, or *storage.BlobNotFoundError
 // if absent. The caller owns closing the reader. A backend fault is a typed *BlobOpError
 // (fail closed) — never conflated with absence.
 func (s *blobStore) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	k, err := blobKeyForName(key)
 	if err != nil {
-		return nil, err // *storekit.InvalidNameError, verbatim
+		return nil, err // *storage.InvalidNameError, verbatim
 	}
 	rc, err := s.seam.get(ctx, k)
 	if err != nil {
 		if errors.Is(err, errObjNotFound) {
-			return nil, &storekit.BlobNotFoundError{Key: key}
+			return nil, &storage.BlobNotFoundError{Key: key}
 		}
 		return nil, &BlobOpError{Key: key, Op: "get", Cause: err}
 	}
@@ -139,7 +139,7 @@ func (s *blobStore) Get(ctx context.Context, key string) (io.ReadCloser, error) 
 func (s *blobStore) Delete(ctx context.Context, key string) error {
 	k, err := blobKeyForName(key)
 	if err != nil {
-		return err // *storekit.InvalidNameError, verbatim
+		return err // *storage.InvalidNameError, verbatim
 	}
 	if err := s.seam.delete(ctx, k); err != nil {
 		return &BlobOpError{Key: key, Op: "delete", Cause: err}
@@ -158,14 +158,14 @@ func (s *blobStore) List(ctx context.Context, prefix string) ([]string, error) {
 	return sortedDedupFiltered(all, prefix), nil
 }
 
-// blobKeyForName validates a storekit key and returns it UNCHANGED as the ObjectStore
+// blobKeyForName validates a storage key and returns it UNCHANGED as the ObjectStore
 // object name. ObjectStore base64-encodes the name internally for its meta/chunk subjects,
 // so it imposes no charset restriction of its own; the identity mapping therefore
-// round-trips every valid storekit key verbatim (List returns the original names) and
-// List(prefix) is a literal substring filter. It returns the *storekit.InvalidNameError
+// round-trips every valid storage key verbatim (List returns the original names) and
+// List(prefix) is a literal substring filter. It returns the *storage.InvalidNameError
 // verbatim for an invalid key.
 func blobKeyForName(key string) (string, error) {
-	if err := storekit.ValidateName(key); err != nil {
+	if err := storage.ValidateName(key); err != nil {
 		return "", err
 	}
 	return key, nil

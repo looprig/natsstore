@@ -16,7 +16,7 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 )
 
-// TestLedgerConformance runs the full storekit ledger conformance suite against the
+// TestLedgerConformance runs the full storage ledger conformance suite against the
 // JetStream-backed ledger over an embedded, in-process engine (no network). Every
 // factory call stands up a FRESH engine on its own StoreDir (a unique subdirectory
 // under the confined test root), so each subtest's backend is fully isolated and the
@@ -29,7 +29,7 @@ func TestLedgerConformance(t *testing.T) {
 	t.Setenv("XDG_DATA_HOME", root) // confinement root for every per-backend StoreDir
 	var counter atomic.Uint64
 
-	storetest.TestLedger(t, func(t *testing.T) storekit.Ledger {
+	storetest.TestLedger(t, func(t *testing.T) storage.Ledger {
 		n := counter.Add(1)
 		dir := filepath.Join(root, "e"+strconv.FormatUint(n, 10), "jetstream")
 		eng, err := OpenEngine(EngineOptions{DataDir: dir, SyncInterval: 50 * time.Millisecond})
@@ -94,7 +94,7 @@ func newKVBackend(t *testing.T, root string, counter *atomic.Uint64) *kvStore {
 	return newKVStore(newJetStreamKVStoreSeam(kv))
 }
 
-// TestKVConformance runs the full storekit KV conformance suite against the JetStream-KV-
+// TestKVConformance runs the full storage KV conformance suite against the JetStream-KV-
 // backed store over an embedded, in-process engine (no network). Every factory call gets
 // a FRESH engine + bucket on its own StoreDir, so each subtest is isolated, revisions
 // start at 1, and the store sees the caller's real, unmangled keys (the suite asserts on
@@ -106,7 +106,7 @@ func TestKVConformance(t *testing.T) {
 	t.Setenv("XDG_DATA_HOME", root)
 	var counter atomic.Uint64
 
-	storetest.TestKV(t, func(t *testing.T) storekit.KV {
+	storetest.TestKV(t, func(t *testing.T) storage.KV {
 		return newKVBackend(t, root, &counter)
 	})
 }
@@ -137,7 +137,7 @@ func newBlobsBackend(t *testing.T, root string, counter *atomic.Uint64) *blobSto
 	return newBlobStore(newJetStreamObjectSeam(obj))
 }
 
-// TestBlobsConformance runs the full storekit Blobs conformance suite against the
+// TestBlobsConformance runs the full storage Blobs conformance suite against the
 // JetStream-ObjectStore-backed store over an embedded, in-process engine (no network).
 // Every factory call gets a FRESH engine + object store on its own StoreDir, so each
 // subtest is isolated and the store sees the caller's real, unmangled keys (the suite
@@ -149,12 +149,12 @@ func TestBlobsConformance(t *testing.T) {
 	t.Setenv("XDG_DATA_HOME", root)
 	var counter atomic.Uint64
 
-	storetest.TestBlobs(t, func(t *testing.T) storekit.Blobs {
+	storetest.TestBlobs(t, func(t *testing.T) storage.Blobs {
 		return newBlobsBackend(t, root, &counter)
 	})
 }
 
-// TestLeaserConformance runs the full storekit Leaser conformance suite against the
+// TestLeaserConformance runs the full storage Leaser conformance suite against the
 // JetStream-KV-backed leaser over an embedded, in-process engine (no network). Every
 // factory call gets a FRESH engine + bucket on its own StoreDir, so each subtest is
 // isolated and the leaser sees the caller's real, unmangled names (the suite asserts on
@@ -166,7 +166,7 @@ func TestLeaserConformance(t *testing.T) {
 	t.Setenv("XDG_DATA_HOME", root)
 	var counter atomic.Uint64
 
-	storetest.TestLeaser(t, func(t *testing.T) storekit.Leaser {
+	storetest.TestLeaser(t, func(t *testing.T) storage.Leaser {
 		return newLeaserBackend(t, root, &counter, defaultLeaseTTL)
 	})
 }
@@ -217,7 +217,7 @@ func TestLeaserReclaimAfterTTLExpiry(t *testing.T) {
 		t.Error("reclaimed lease B.Lost() is closed, want open (live)")
 	}
 	_, err = le.Acquire(ctx, name)
-	var held *storekit.LeaseHeldError
+	var held *storage.LeaseHeldError
 	if !errors.As(err, &held) {
 		t.Fatalf("Acquire while B holds = %v, want *LeaseHeldError", err)
 	}

@@ -7,9 +7,9 @@ import (
 	"github.com/looprig/storage"
 )
 
-// A storekit name is '/'-joined segments over [a-z0-9][a-z0-9_.-]*, so it only
+// A storage name is '/'-joined segments over [a-z0-9][a-z0-9_.-]*, so it only
 // ever contains lowercase letters, digits, '_', '.', '-' and '/'. Both mappings
-// below rely on that: every encoder validates with storekit.ValidateName first,
+// below rely on that: every encoder validates with storage.ValidateName first,
 // so the escape schemes never have to reason about bytes the grammar forbids
 // (notably '%', which is why it can safely mark an escape).
 
@@ -24,7 +24,7 @@ const subjectDotEscape = "%2E"
 const streamEscape = '_'
 
 // NameEncodingError reports an encoded token — a JetStream subject or stream
-// name — that does not decode back to a valid storekit name, i.e. one this
+// name — that does not decode back to a valid storage name, i.e. one this
 // package's encoders never emit. Value is the offending token.
 type NameEncodingError struct {
 	Value  string
@@ -35,12 +35,12 @@ func (e *NameEncodingError) Error() string {
 	return "natsstore: malformed encoded name " + strconv.Quote(e.Value) + ": " + e.Reason
 }
 
-// subjectForName maps a storekit name to a JetStream subject. It validates the
-// name (returning the *storekit.InvalidNameError verbatim), escapes every
+// subjectForName maps a storage name to a JetStream subject. It validates the
+// name (returning the *storage.InvalidNameError verbatim), escapes every
 // literal '.' to %2E, then remaps '/' onto '.' — the subject-token separator.
 // The dot escape must run before the slash remap so the two byte roles never mix.
 func subjectForName(name string) (string, error) {
-	if err := storekit.ValidateName(name); err != nil {
+	if err := storage.ValidateName(name); err != nil {
 		return "", err
 	}
 	return encodeSubject(name), nil
@@ -54,8 +54,8 @@ func subjectForName(name string) (string, error) {
 func nameFromSubject(subj string) (string, error) {
 	unhier := strings.ReplaceAll(subj, ".", "/")
 	name := strings.ReplaceAll(unhier, subjectDotEscape, ".")
-	if err := storekit.ValidateName(name); err != nil {
-		return "", &NameEncodingError{Value: subj, Reason: "does not decode to a valid storekit name"}
+	if err := storage.ValidateName(name); err != nil {
+		return "", &NameEncodingError{Value: subj, Reason: "does not decode to a valid storage name"}
 	}
 	if encodeSubject(name) != subj {
 		return "", &NameEncodingError{Value: subj, Reason: "not a canonical subject encoding"}
@@ -69,14 +69,14 @@ func encodeSubject(name string) string {
 	return strings.ReplaceAll(escaped, "/", ".")
 }
 
-// streamForName maps a storekit name to a JetStream stream name, which may only
-// contain [a-z0-9_-]. It validates first (returning *storekit.InvalidNameError),
+// streamForName maps a storage name to a JetStream stream name, which may only
+// contain [a-z0-9_-]. It validates first (returning *storage.InvalidNameError),
 // then reversibly escapes the three bytes a name can carry that a stream name
 // cannot: '_' → "_u", '.' → "_d", '/' → "_s". '-', lowercase letters and digits
 // pass through. Because '_' escapes itself, the mapping is injective — unlike a
 // naive "'.'/'/' both become '_'", which would alias "a.b" and "a/b".
 func streamForName(name string) (string, error) {
-	if err := storekit.ValidateName(name); err != nil {
+	if err := storage.ValidateName(name); err != nil {
 		return "", err
 	}
 	return encodeStream(name), nil
@@ -91,8 +91,8 @@ func nameFromStream(stream string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := storekit.ValidateName(name); err != nil {
-		return "", &NameEncodingError{Value: stream, Reason: "does not decode to a valid storekit name"}
+	if err := storage.ValidateName(name); err != nil {
+		return "", &NameEncodingError{Value: stream, Reason: "does not decode to a valid storage name"}
 	}
 	if encodeStream(name) != stream {
 		return "", &NameEncodingError{Value: stream, Reason: "not a canonical stream encoding"}

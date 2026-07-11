@@ -1,9 +1,9 @@
 package natsstore
 
 // This file is natsstore's composition root: it wires the four JetStream backends
-// (ledger, leaser, KV, blobs) over a single NATS connection into one storekit
+// (ledger, leaser, KV, blobs) over a single NATS connection into one storage
 // field-bundle and exposes lifecycle (Open/Close). It is the module's public entry
-// point; a consumer opens a Store here and hands its *storekit.Composite to a facade
+// point; a consumer opens a Store here and hands its *storage.Composite to a facade
 // such as sessionstore.Open.
 //
 // # Two backends behind one door
@@ -15,10 +15,10 @@ package natsstore
 //
 // # Why a field-bundle, not an all-four interface
 //
-// storekit's four primitives collide on method names (each of Ledger, KV, and Blobs has
-// its own Delete), so NO single Go type can implement all four at once. storekit solves
+// storage's four primitives collide on method names (each of Ledger, KV, and Blobs has
+// its own Delete), so NO single Go type can implement all four at once. storage solves
 // this with Composite, a struct that embeds one provider per primitive. Store follows the
-// same shape (as fsstore does): it embeds *storekit.Composite rather than pretending to
+// same shape (as fsstore does): it embeds *storage.Composite rather than pretending to
 // satisfy Ledger+Leaser+KV+Blobs itself. A consumer that wants the whole bundle is handed
 // store.Composite (or Backend()).
 
@@ -188,13 +188,13 @@ func resolveMaxPayload(requested int32) (int32, error) {
 }
 
 // Store is an open natsstore over one NATS backend — an owned embedded engine, or a
-// remote connection. It embeds *storekit.Composite, so a caller reaches each primitive as
+// remote connection. It embeds *storage.Composite, so a caller reaches each primitive as
 // a promoted field (store.Ledger, store.Leaser, store.KV, store.Blobs) and hands the whole
 // bundle to a consumer as store.Composite or via Backend. The four primitives collide on
 // method names, so no single type can implement all four (see the file-level comment);
 // embedding the field-bundle is how Store sidesteps that.
 type Store struct {
-	*storekit.Composite
+	*storage.Composite
 
 	// engine is the owned embedded engine (embedded mode); conn is the owned remote
 	// connection (remote mode). Exactly one is non-nil, decided at Open, and it is what
@@ -206,12 +206,12 @@ type Store struct {
 	closed bool
 }
 
-// Open assembles a JetStream-backed storekit bundle over a single NATS backend chosen by
+// Open assembles a JetStream-backed storage bundle over a single NATS backend chosen by
 // opts: an embedded in-process server the Store owns (Options.EmbeddedDir) or a remote URL
 // (Options.URL). It validates opts (*OptionsError on a bad combination), stands the
 // backend up, provisions the ledger stream lazily plus the lease/kv/object buckets
 // idempotently (so a reopen of the same embedded dir rebinds rather than fails), and wires
-// the four primitives with storekit.NewComposite.
+// the four primitives with storage.NewComposite.
 //
 // ctx bounds the bucket-provisioning round-trips; pass a ctx with a deadline. On any
 // wiring failure Open tears the backend down (drains the connection, shuts an embedded
@@ -286,7 +286,7 @@ type backingBuckets struct {
 // JetStreamContext (its expected-last-sequence publish fence lives on that API), and the
 // leaser/kv/blobs on the context-aware jetstream package (their round-trips honor ctx). It
 // returns a wiring failure as a typed *WiringError; the caller owns tearing conn down.
-func buildComposite(ctx context.Context, conn *nats.Conn) (*storekit.Composite, error) {
+func buildComposite(ctx context.Context, conn *nats.Conn) (*storage.Composite, error) {
 	jsLegacy, err := conn.JetStream()
 	if err != nil {
 		return nil, &WiringError{Component: "jetstream-context", Cause: err}
@@ -303,7 +303,7 @@ func buildComposite(ctx context.Context, conn *nats.Conn) (*storekit.Composite, 
 	leaser := newLeaserStore(newJetStreamKVSeam(buckets.lease), defaultLeaseTTL, time.Now)
 	kv := newKVStore(newJetStreamKVStoreSeam(buckets.kv))
 	blobs := newBlobStore(newJetStreamObjectSeam(buckets.obj))
-	comp, err := storekit.NewComposite(ledger, leaser, kv, blobs)
+	comp, err := storage.NewComposite(ledger, leaser, kv, blobs)
 	if err != nil {
 		return nil, &WiringError{Component: "composite", Cause: err}
 	}
@@ -331,9 +331,9 @@ func provisionBuckets(ctx context.Context, jsx jetstream.JetStream) (backingBuck
 }
 
 // Backend returns the assembled four-primitive bundle to hand to a consumer such as
-// sessionstore.Open. It is the embedded *storekit.Composite; callers may read
+// sessionstore.Open. It is the embedded *storage.Composite; callers may read
 // store.Composite directly instead.
-func (s *Store) Backend() *storekit.Composite { return s.Composite }
+func (s *Store) Backend() *storage.Composite { return s.Composite }
 
 // Close tears the Store's owned backend down: it drains the connection (flushing an
 // in-flight append) and, in embedded mode, shuts the in-process server down afterwards —

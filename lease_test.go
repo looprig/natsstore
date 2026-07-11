@@ -150,7 +150,7 @@ func TestLeaserAcquireEpochAndErrors(t *testing.T) {
 		defer func() { _ = first.Release(ctx) }()
 
 		_, err = s.Acquire(ctx, name) // same (fixed) clock -> first is still live
-		var held *storekit.LeaseHeldError
+		var held *storage.LeaseHeldError
 		if !errors.As(err, &held) {
 			t.Fatalf("second Acquire = %v, want *LeaseHeldError", err)
 		}
@@ -194,7 +194,7 @@ func TestLeaserAcquireEpochAndErrors(t *testing.T) {
 		if !errors.As(err, &op) {
 			t.Fatalf("Acquire = %v, want *LeaseOpError (fail closed)", err)
 		}
-		var held *storekit.LeaseHeldError
+		var held *storage.LeaseHeldError
 		if errors.As(err, &held) {
 			t.Error("an ambiguous read was mis-classified as LeaseHeldError")
 		}
@@ -263,7 +263,7 @@ func TestLeaserAcquireInvalidName(t *testing.T) {
 			f := newFakeKVSeam()
 			s := newLeaserStore(f, unitTTL, newTestClock().Now)
 			_, err := s.Acquire(context.Background(), bad.value)
-			var ine *storekit.InvalidNameError
+			var ine *storage.InvalidNameError
 			if !errors.As(err, &ine) {
 				t.Fatalf("Acquire(%q) = %v, want *InvalidNameError", bad.value, err)
 			}

@@ -125,7 +125,7 @@ func (s *jetStreamSeam) deleteStream(ctx context.Context, stream string) error {
 // Unlike the ledger's legacy JetStreamContext seam, this uses the nats.go v1.52.0
 // `jetstream` package, whose Create/Get/Update accept a context.Context — so the
 // caller's ctx genuinely bounds the Acquire and Release round-trips (honoring the
-// storekit.Lease "releasing may cross the network; ctx bounds it" contract). (The
+// storage.Lease "releasing may cross the network; ctx bounds it" contract). (The
 // ledger seam remains on the legacy API for now; unifying it is deferred to D5.)
 type jetStreamKVSeam struct {
 	kv jetstream.KeyValue
@@ -225,7 +225,7 @@ func (s *jetStreamKVStoreSeam) keys(ctx context.Context) ([]string, error) {
 // file storage, one replica (single-node embedded), and History 1 (the KV store is a
 // pure revision-CAS latest-value store — no historical values are read). MaxValueSize is
 // left at the default (unlimited, bounded only by the connection's MaxPayload), so the
-// storekit 1 MiB value floor round-trips. It is DISTINCT from leaseBucketConfig's bucket.
+// storage 1 MiB value floor round-trips. It is DISTINCT from leaseBucketConfig's bucket.
 func kvBucketConfig(bucket string) jetstream.KeyValueConfig {
 	return jetstream.KeyValueConfig{
 		Bucket:   bucket,
@@ -347,7 +347,7 @@ func (s *jetStreamObjectSeam) getInfo(ctx context.Context, key string) ([]byte, 
 
 // objectStoreConfig returns the jetstream ObjectStore configuration for the blob store's
 // bucket: file storage and one replica (single-node embedded). MaxBytes is left at the
-// default (unlimited); ObjectStore chunks large objects, so the storekit 1 MiB blob floor
+// default (unlimited); ObjectStore chunks large objects, so the storage 1 MiB blob floor
 // round-trips without special sizing.
 func objectStoreConfig(bucket string) jetstream.ObjectStoreConfig {
 	return jetstream.ObjectStoreConfig{

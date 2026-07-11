@@ -46,7 +46,7 @@ type kvSeam interface {
 // KVOpError reports a definite failure of a KV operation kvStore performs (get / create
 // / update / delete / keys) that is NOT one of the expected CAS outcomes — a backend
 // fault or an ambiguous read. It fails closed and names the key (or, for keys, the
-// prefix), the operation, and unwraps to the underlying cause. (The storekit taxonomy's
+// prefix), the operation, and unwraps to the underlying cause. (The storage taxonomy's
 // only KV errors are KeyNotFoundError and ConflictError — neither fits a backend fault —
 // so this is a natsstore-specific typed error, analogous to StreamOpError / LeaseOpError.)
 type KVOpError struct {
@@ -60,7 +60,7 @@ func (e *KVOpError) Error() string {
 }
 func (e *KVOpError) Unwrap() error { return e.Cause }
 
-// kvStore implements storekit.KV over one JetStream KV bucket, one entry per key. It
+// kvStore implements storage.KV over one JetStream KV bucket, one entry per key. It
 // holds only the seam (DIP) and carries no mutable state, so it is as safe for concurrent
 // use as the seam beneath it. Keys map DIRECTLY to JetStream KV keys (see kvKeyForName)
 // and revisions map directly to JetStream KV revisions.
@@ -68,24 +68,24 @@ type kvStore struct {
 	seam kvSeam
 }
 
-var _ storekit.KV = (*kvStore)(nil)
+var _ storage.KV = (*kvStore)(nil)
 
 // newKVStore builds a KV store over seam.
 func newKVStore(seam kvSeam) *kvStore {
 	return &kvStore{seam: seam}
 }
 
-// Get returns the value and revision at key, or *storekit.KeyNotFoundError if absent.
+// Get returns the value and revision at key, or *storage.KeyNotFoundError if absent.
 // A backend fault is a typed *KVOpError (fail closed) — never conflated with absence.
 func (s *kvStore) Get(ctx context.Context, key string) ([]byte, uint64, error) {
 	k, err := kvKeyForName(key)
 	if err != nil {
-		return nil, 0, err // *storekit.InvalidNameError, verbatim
+		return nil, 0, err // *storage.InvalidNameError, verbatim
 	}
 	val, rev, err := s.seam.get(ctx, k)
 	if err != nil {
 		if errors.Is(err, errKVKeyNotFound) {
-			return nil, 0, &storekit.KeyNotFoundError{Key: key}
+			return nil, 0, &storage.KeyNotFoundError{Key: key}
 		}
 		return nil, 0, &KVOpError{Key: key, Op: "get", Cause: err}
 	}
@@ -94,14 +94,14 @@ func (s *kvStore) Get(ctx context.Context, key string) ([]byte, uint64, error) {
 
 // Put writes val at key under a revision fence and returns the new revision. expectedRev
 // 0 is a create (the key must be absent); a losing create — the key already holds a live
-// value — is a *storekit.ConflictError{Expected:0}. A non-zero expectedRev is a
+// value — is a *storage.ConflictError{Expected:0}. A non-zero expectedRev is a
 // revision-CAS update; a mismatch (including an update against an absent/deleted key,
 // which JetStream also rejects as a wrong-last-sequence) is a
-// *storekit.ConflictError{Expected:expectedRev}, leaving the stored value unchanged.
+// *storage.ConflictError{Expected:expectedRev}, leaving the stored value unchanged.
 func (s *kvStore) Put(ctx context.Context, key string, expectedRev uint64, val []byte) (uint64, error) {
 	k, err := kvKeyForName(key)
 	if err != nil {
-		return 0, err // *storekit.InvalidNameError, verbatim
+		return 0, err // *storage.InvalidNameError, verbatim
 	}
 	if expectedRev == 0 {
 		return s.create(ctx, key, k, val)
@@ -109,27 +109,27 @@ func (s *kvStore) Put(ctx context.Context, key string, expectedRev uint64, val [
 	return s.update(ctx, key, k, expectedRev, val)
 }
 
-// create maps a create-if-absent onto the storekit contract: success → new revision,
+// create maps a create-if-absent onto the storage contract: success → new revision,
 // a losing create → *ConflictError{Expected:0}, any other fault → *KVOpError.
 func (s *kvStore) create(ctx context.Context, key, k string, val []byte) (uint64, error) {
 	rev, err := s.seam.create(ctx, k, val)
 	if err != nil {
 		if errors.Is(err, errKVKeyExists) {
-			return 0, &storekit.ConflictError{Name: key, Expected: 0}
+			return 0, &storage.ConflictError{Name: key, Expected: 0}
 		}
 		return 0, &KVOpError{Key: key, Op: "create", Cause: err}
 	}
 	return rev, nil
 }
 
-// update maps a revision-CAS update onto the storekit contract: success → new revision,
+// update maps a revision-CAS update onto the storage contract: success → new revision,
 // a CAS conflict OR an absent/deleted key → *ConflictError{Expected:expectedRev} (both
 // mean "the revision you fenced on is not the current one"), any other fault → *KVOpError.
 func (s *kvStore) update(ctx context.Context, key, k string, expectedRev uint64, val []byte) (uint64, error) {
 	rev, err := s.seam.update(ctx, k, val, expectedRev)
 	if err != nil {
 		if errors.Is(err, errKVCASConflict) || errors.Is(err, errKVKeyNotFound) {
-			return 0, &storekit.ConflictError{Name: key, Expected: expectedRev}
+			return 0, &storage.ConflictError{Name: key, Expected: expectedRev}
 		}
 		return 0, &KVOpError{Key: key, Op: "update", Cause: err}
 	}
@@ -153,7 +153,7 @@ func (s *kvStore) Keys(ctx context.Context, prefix string) ([]string, error) {
 func (s *kvStore) Delete(ctx context.Context, key string) error {
 	k, err := kvKeyForName(key)
 	if err != nil {
-		return err // *storekit.InvalidNameError, verbatim
+		return err // *storage.InvalidNameError, verbatim
 	}
 	if err := s.seam.del(ctx, k); err != nil {
 		return &KVOpError{Key: key, Op: "delete", Cause: err}
@@ -161,14 +161,14 @@ func (s *kvStore) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
-// kvKeyForName validates a storekit key and returns it UNCHANGED as the JetStream KV key.
-// The storekit grammar ([a-z0-9][a-z0-9_.-]* segments joined by '/') is a strict subset
+// kvKeyForName validates a storage key and returns it UNCHANGED as the JetStream KV key.
+// The storage grammar ([a-z0-9][a-z0-9_.-]* segments joined by '/') is a strict subset
 // of JetStream KV's allowed key charset [-/_=.a-zA-Z0-9], so the mapping is the identity:
 // no two valid keys alias one entry, Keys round-trips them verbatim, and Keys(prefix) is a
-// literal substring filter. It returns the *storekit.InvalidNameError verbatim for an
+// literal substring filter. It returns the *storage.InvalidNameError verbatim for an
 // invalid key, so every entry point validates in one call.
 func kvKeyForName(key string) (string, error) {
-	if err := storekit.ValidateName(key); err != nil {
+	if err := storage.ValidateName(key); err != nil {
 		return "", err
 	}
 	return key, nil
@@ -176,7 +176,7 @@ func kvKeyForName(key string) (string, error) {
 
 // sortedDedupFiltered returns the elements of all that begin with prefix, sorted
 // ascending with duplicates removed. It returns nil (not an empty non-nil slice) for no
-// matches, which the storekit listing contract treats as equal to empty. Shared by
+// matches, which the storage listing contract treats as equal to empty. Shared by
 // KV.Keys and Blobs.List, whose listing contracts are identical.
 func sortedDedupFiltered(all []string, prefix string) []string {
 	var out []string
