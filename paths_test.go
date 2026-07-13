@@ -67,9 +67,32 @@ func TestStoreStoragePaths(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			store := &Store{localPathReporter: tt.reporter}
+			store := &Store{pathReporter: tt.reporter}
 			if got := store.StoragePaths(); !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("StoragePaths() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestStorePathReporterMethodSet(t *testing.T) {
+	t.Parallel()
+
+	reporterType := reflect.TypeOf((*storage.PathReporter)(nil)).Elem()
+	tests := []struct {
+		name   string
+		typeOf reflect.Type
+		want   bool
+	}{
+		{name: "pointer implements", typeOf: reflect.TypeOf((*Store)(nil)), want: true},
+		{name: "value does not implement", typeOf: reflect.TypeOf(Store{}), want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := tt.typeOf.Implements(reporterType); got != tt.want {
+				t.Errorf("Implements(storage.PathReporter) = %v, want %v", got, tt.want)
 			}
 		})
 	}

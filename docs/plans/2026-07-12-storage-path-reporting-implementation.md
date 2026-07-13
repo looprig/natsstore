@@ -4,7 +4,7 @@
 
 **Goal:** Make embedded natsstore providers report their frozen canonical JetStream persistence directory through `storage.PathReporter`, while remote providers report none.
 
-**Architecture:** Add one private immutable reporter value that clones paths on construction and return. Embed it in `Store` and all four concrete primitive adapters, and inject the same value while composing an embedded or remote store. Canonicalize the embedded directory only after the engine has created it, closing the engine on any resolution failure.
+**Architecture:** Add one private immutable reporter value that clones paths on construction and return. Hold it in a named field on `Store`, expose it through an explicit pointer-receiver method, embed it in the four private concrete primitive adapters, and inject the same value while composing an embedded or remote store. Canonicalize the embedded directory only after the engine has created it, closing the engine on any resolution failure.
 
 **Tech Stack:** Go 1.25, `github.com/looprig/storage` v0.2.0, NATS JetStream, standard-library `path/filepath`, Go race detector.
 
@@ -59,7 +59,7 @@ func (r localPathReporter) StoragePaths() []string {
 }
 ```
 
-Embed `localPathReporter` in `Store`, `ledgerStore`, `leaserStore`, `kvStore`, and `blobStore`. Existing primitive constructors leave it at the zero value so unit-only adapters correctly report no local persistence path.
+Hold `localPathReporter` in a named private `Store` field and add an explicit pointer-receiver `StoragePaths` method, so a copied `Store` value does not implement `storage.PathReporter`. Embed the reporter in `ledgerStore`, `leaserStore`, `kvStore`, and `blobStore`. Existing primitive constructors leave it at the zero value so unit-only adapters correctly report no local persistence path.
 
 **Step 4: Run the test to verify it passes**
 

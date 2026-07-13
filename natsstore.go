@@ -195,7 +195,7 @@ func resolveMaxPayload(requested int32) (int32, error) {
 // embedding the field-bundle is how Store sidesteps that.
 type Store struct {
 	*storage.Composite
-	localPathReporter
+	pathReporter localPathReporter
 
 	// engine is the owned embedded engine (embedded mode); conn is the owned remote
 	// connection (remote mode). Exactly one is non-nil, decided at Open, and it is what
@@ -206,6 +206,11 @@ type Store struct {
 	mu     sync.Mutex
 	closed bool
 }
+
+// StoragePaths returns the Store's frozen local persistence roots. It deliberately has
+// a pointer receiver: Store contains live backend handles and a mutex and must not gain
+// a value-copy-friendly interface method set.
+func (s *Store) StoragePaths() []string { return s.pathReporter.StoragePaths() }
 
 // Open assembles a JetStream-backed storage bundle over a single NATS backend chosen by
 // opts: an embedded in-process server the Store owns (Options.EmbeddedDir) or a remote URL
@@ -256,7 +261,7 @@ func openEmbedded(ctx context.Context, res resolvedOptions) (*Store, error) {
 		_ = eng.Close()
 		return nil, err
 	}
-	return &Store{Composite: comp, localPathReporter: reporter, engine: eng}, nil
+	return &Store{Composite: comp, pathReporter: reporter, engine: eng}, nil
 }
 
 // openRemote dials the remote URL with explicit, secure defaults (no InsecureSkipVerify;
@@ -278,7 +283,7 @@ func openRemote(ctx context.Context, res resolvedOptions) (*Store, error) {
 		conn.Close()
 		return nil, err
 	}
-	return &Store{Composite: comp, localPathReporter: reporter, conn: conn}, nil
+	return &Store{Composite: comp, pathReporter: reporter, conn: conn}, nil
 }
 
 // backingBuckets are the three provisioned JetStream buckets a Store's leaser, KV, and

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -26,6 +27,9 @@ func TestOpenEmbeddedReportsCanonicalStoragePath(t *testing.T) {
 	}
 	linkedParent := filepath.Join(root, "linked")
 	if err := os.Symlink(realParent, linkedParent); err != nil {
+		if runtime.GOOS == "windows" || errors.Is(err, os.ErrPermission) {
+			t.Skipf("symlink capability unavailable: %v", err)
+		}
 		t.Fatalf("Symlink(%q, %q): %v", realParent, linkedParent, err)
 	}
 
