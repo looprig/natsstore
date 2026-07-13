@@ -195,6 +195,7 @@ func resolveMaxPayload(requested int32) (int32, error) {
 // embedding the field-bundle is how Store sidesteps that.
 type Store struct {
 	*storage.Composite
+	localPathReporter
 
 	// engine is the owned embedded engine (embedded mode); conn is the owned remote
 	// connection (remote mode). Exactly one is non-nil, decided at Open, and it is what
@@ -244,12 +245,18 @@ func openEmbedded(ctx context.Context, res resolvedOptions) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	comp, err := buildComposite(ctx, eng.Conn())
+	canonical, err := canonicalStoragePath(res.embeddedDir)
 	if err != nil {
 		_ = eng.Close()
 		return nil, err
 	}
-	return &Store{Composite: comp, engine: eng}, nil
+	reporter := newLocalPathReporter(canonical)
+	comp, err := buildComposite(ctx, eng.Conn(), reporter)
+	if err != nil {
+		_ = eng.Close()
+		return nil, err
+	}
+	return &Store{Composite: comp, localPathReporter: reporter, engine: eng}, nil
 }
 
 // openRemote dials the remote URL with explicit, secure defaults (no InsecureSkipVerify;
@@ -265,12 +272,13 @@ func openRemote(ctx context.Context, res resolvedOptions) (*Store, error) {
 	if err != nil {
 		return nil, &ConnectError{URL: redactURL(res.url), Cause: err}
 	}
-	comp, err := buildComposite(ctx, conn)
+	reporter := newLocalPathReporter()
+	comp, err := buildComposite(ctx, conn, reporter)
 	if err != nil {
 		conn.Close()
 		return nil, err
 	}
-	return &Store{Composite: comp, conn: conn}, nil
+	return &Store{Composite: comp, localPathReporter: reporter, conn: conn}, nil
 }
 
 // backingBuckets are the three provisioned JetStream buckets a Store's leaser, KV, and
@@ -286,7 +294,7 @@ type backingBuckets struct {
 // JetStreamContext (its expected-last-sequence publish fence lives on that API), and the
 // leaser/kv/blobs on the context-aware jetstream package (their round-trips honor ctx). It
 // returns a wiring failure as a typed *WiringError; the caller owns tearing conn down.
-func buildComposite(ctx context.Context, conn *nats.Conn) (*storage.Composite, error) {
+func buildComposite(ctx context.Context, conn *nats.Conn, reporter localPathReporter) (*storage.Composite, error) {
 	jsLegacy, err := conn.JetStream()
 	if err != nil {
 		return nil, &WiringError{Component: "jetstream-context", Cause: err}
@@ -303,6 +311,10 @@ func buildComposite(ctx context.Context, conn *nats.Conn) (*storage.Composite, e
 	leaser := newLeaserStore(newJetStreamKVSeam(buckets.lease), defaultLeaseTTL, time.Now)
 	kv := newKVStore(newJetStreamKVStoreSeam(buckets.kv))
 	blobs := newBlobStore(newJetStreamObjectSeam(buckets.obj))
+	ledger.localPathReporter = reporter
+	leaser.localPathReporter = reporter
+	kv.localPathReporter = reporter
+	blobs.localPathReporter = reporter
 	comp, err := storage.NewComposite(ledger, leaser, kv, blobs)
 	if err != nil {
 		return nil, &WiringError{Component: "composite", Cause: err}

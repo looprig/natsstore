@@ -6,12 +6,74 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/looprig/storage"
 )
+
+func TestOpenEmbeddedReportsCanonicalStoragePath(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	realParent := filepath.Join(root, "real")
+	if err := os.Mkdir(realParent, 0o700); err != nil {
+		t.Fatalf("Mkdir(%q): %v", realParent, err)
+	}
+	linkedParent := filepath.Join(root, "linked")
+	if err := os.Symlink(realParent, linkedParent); err != nil {
+		t.Fatalf("Symlink(%q, %q): %v", realParent, linkedParent, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	st, err := Open(ctx, Options{EmbeddedDir: filepath.Join(linkedParent, "jetstream")})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close(ctx) })
+
+	reporters := []struct {
+		name     string
+		reporter storage.PathReporter
+	}{{name: "store", reporter: st}}
+	for _, candidate := range []struct {
+		name     string
+		reporter storage.PathReporter
+	}{
+		{name: "ledger", reporter: st.Ledger.(storage.PathReporter)},
+		{name: "leaser", reporter: st.Leaser.(storage.PathReporter)},
+		{name: "kv", reporter: st.KV.(storage.PathReporter)},
+		{name: "blobs", reporter: st.Blobs.(storage.PathReporter)},
+	} {
+		reporters = append(reporters, candidate)
+	}
+
+	canonical, err := filepath.EvalSymlinks(filepath.Join(realParent, "jetstream"))
+	if err != nil {
+		t.Fatalf("EvalSymlinks(expected path): %v", err)
+	}
+	want := []string{canonical}
+	first := reporters[0].reporter.StoragePaths()
+	if !reflect.DeepEqual(first, want) {
+		t.Fatalf("store StoragePaths() = %v, want %v", first, want)
+	}
+	first[0] = filepath.Join(root, "mutated")
+
+	for _, reporter := range reporters {
+		t.Run(reporter.name, func(t *testing.T) {
+			t.Parallel()
+			if got := reporter.reporter.StoragePaths(); !reflect.DeepEqual(got, want) {
+				t.Errorf("StoragePaths() = %v, want %v", got, want)
+			}
+		})
+	}
+}
 
 // TestOpenEmbeddedRoundtrip is the public-entry-point end-to-end proof: Open on a PLAIN
 // t.TempDir() — deliberately NOT under $XDG_DATA_HOME and NOT under $HOME (we set no XDG

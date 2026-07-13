@@ -67,6 +67,7 @@ func (e *RecordReadError) Unwrap() error { return e.Cause }
 // seam beneath it.
 type ledgerStore struct {
 	seam jsSeam
+	localPathReporter
 }
 
 var _ storage.Ledger = (*ledgerStore)(nil)

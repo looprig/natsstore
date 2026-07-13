@@ -108,6 +108,7 @@ type leaserStore struct {
 	seam kvLeaseSeam
 	ttl  time.Duration
 	now  leaseClock
+	localPathReporter
 }
 
 var _ storage.Leaser = (*leaserStore)(nil)

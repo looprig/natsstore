@@ -66,6 +66,7 @@ func (e *KVOpError) Unwrap() error { return e.Cause }
 // and revisions map directly to JetStream KV revisions.
 type kvStore struct {
 	seam kvSeam
+	localPathReporter
 }
 
 var _ storage.KV = (*kvStore)(nil)

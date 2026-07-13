@@ -71,6 +71,7 @@ func (e *BlobOpError) Unwrap() error { return e.Cause }
 // different content is a conflict that leaves the original untouched.
 type blobStore struct {
 	seam objSeam
+	localPathReporter
 }
 
 var _ storage.Blobs = (*blobStore)(nil)
