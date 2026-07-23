@@ -20,6 +20,11 @@ Sanctioned in this module (and nowhere else in the tree):
 - Otherwise **stdlib only**. Any further third-party dependency requires explicit approval;
   reach for the standard library first.
 
+<!-- Approved external packages -->
+- `github.com/securego/gosec/v2` — security static analysis tool (dev/tool only)
+- `golang.org/x/vuln/cmd/govulncheck` — official Go vulnerability scanner (dev/tool only)
+- `honnef.co/go/tools/cmd/staticcheck` — extended static analysis (dev/tool only)
+
 ## Code rules (same discipline as the consuming repos)
 
 - **Strict typing.** No `any`/`interface{}` except at explicit serialization boundaries,
