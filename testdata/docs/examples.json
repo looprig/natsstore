@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "repository": "natsstore",
+  "proofSources": [
+    {
+      "id": "example-natsstore-embedded-composite-fixture",
+      "type": "executable-fixture",
+      "path": "examples/embedded/example_test.go",
+      "symbol": "Example_embeddedComposite"
+    },
+    {
+      "id": "example-natsstore-artifacts-contract-test",
+      "type": "test",
+      "path": "examples/contract_test.go",
+      "symbol": "TestDocsExamplesArtifacts"
+    },
+    {
+      "id": "example-natsstore-open-source",
+      "type": "source",
+      "path": "natsstore.go",
+      "symbol": "Open"
+    }
+  ],
+  "examples": [
+    {
+      "id": "example-natsstore-embedded-composite",
+      "ecosystem": "go",
+      "owner": "natsstore",
+      "sourcePath": "examples/embedded/example_test.go",
+      "availability": "source-workspace",
+      "versions": {
+        "github.com/looprig/natsstore": "source-workspace"
+      },
+      "offlineCommand": "GOWORK=off go test -race ./...",
+      "assertion": "Deterministic Go example output proves remote option validation without a dial, embedded Store ownership, composite ledger/KV/blob/lease behavior, typed conflicts, and idempotent Close.",
+      "workflowPath": ".github/workflows/docs-examples.yml",
+      "jobId": "docs-examples",
+      "cleanup": "The example closes its ledger cursor, blob reader, lease, and Store, then removes its unique temporary embedded StoreDir.",
+      "liveGate": null,
+      "proofIds": [
+        "example-natsstore-embedded-composite-fixture",
+        "example-natsstore-artifacts-contract-test",
+        "example-natsstore-open-source"
+      ]
+    }
+  ]
+}
