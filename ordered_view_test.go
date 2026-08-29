@@ -818,49 +818,66 @@ func TestOrderedViewStopsOnClose(t *testing.T) {
 	}
 }
 
-// TestOrderedStoreCloseCancelsEveryViewBeforeWaiting proves a timed-out Close
-// cannot strand views that happen to follow the first slow view in the map.
-// Both goroutines deliberately wait behind allowExit after observing cancel, so
-// Close must cancel the complete set before any wait can finish.
+// TestOrderedStoreCloseCancelsEveryViewBeforeWaiting proves Close cannot wait
+// for one view before cancelling the rest. Each view refuses to finish until it
+// has observed BOTH cancellations, so a sequential cancel-and-wait deadlocks
+// until the live Close context expires.
 func TestOrderedStoreCloseCancelsEveryViewBeforeWaiting(t *testing.T) {
 	t.Parallel()
 	store := newOrderedStore(newFakeOrderedSeam())
-	allowExit := make(chan struct{})
+	type controlledView struct {
+		ctx            context.Context
+		cancelObserved chan struct{}
+		view           *orderedView
+	}
+	controlled := make([]controlledView, 0, 2)
 	views := make([]*orderedView, 0, 2)
 	for _, namespace := range []string{"sessions", "archive"} {
 		viewCtx, cancelView := context.WithCancel(context.Background())
 		view := &orderedView{namespace: namespace, cancel: cancelView, done: make(chan struct{})}
+		controlled = append(controlled, controlledView{ctx: viewCtx, cancelObserved: make(chan struct{}), view: view})
 		views = append(views, view)
 		store.views[namespace] = view
-		go func() {
-			<-viewCtx.Done()
-			<-allowExit
-			close(view.done)
-		}()
 	}
 	t.Cleanup(func() {
 		for _, view := range views {
 			view.cancel()
 		}
 	})
-
-	closeCtx, cancelClose := context.WithCancel(context.Background())
-	cancelClose()
-	err := store.Close(closeCtx)
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("Close(expired context) = %T %v, want context.Canceled", err, err)
+	release := make(chan struct{})
+	for _, controlledView := range controlled {
+		go func() {
+			<-controlledView.ctx.Done()
+			close(controlledView.cancelObserved)
+			<-release
+			close(controlledView.view.done)
+		}()
 	}
-	close(allowExit)
+
+	closeCtx, cancelClose := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelClose()
+	result := make(chan error, 1)
+	go func() { result <- store.Close(closeCtx) }()
+	for _, controlledView := range controlled {
+		select {
+		case <-controlledView.cancelObserved:
+		case <-time.After(250 * time.Millisecond):
+			cancelClose()
+			close(release)
+			err := <-result
+			t.Fatalf("Close did not cancel view %q before waiting: %v", controlledView.view.namespace, err)
+		}
+	}
+	close(release)
+	err := <-result
+	if err != nil {
+		t.Fatalf("Close(live context) = %v, want nil", err)
+	}
 	for _, view := range views {
 		select {
 		case <-view.done:
-		case <-time.After(time.Second):
-			t.Errorf("view %q was not cancelled by Close", view.namespace)
-		}
-	}
-	for _, namespace := range []string{"sessions", "archive"} {
-		if !strings.Contains(err.Error(), namespace) {
-			t.Errorf("Close error %q does not include failed view %q", err, namespace)
+		default:
+			t.Errorf("view %q done channel is still open after Close", view.namespace)
 		}
 	}
 }
@@ -917,6 +934,38 @@ func TestOrderedViewRebootsAfterRepairableConfigurationFatal(t *testing.T) {
 	}
 	if starts := f.watchStartCount(); starts != 2 {
 		t.Errorf("watchStream was started %d times, want 2 (fatal view plus fresh view)", starts)
+	}
+}
+
+// TestOrderedViewStaleFatalCannotEvictReplacement proves eviction is bound to
+// the view that observed the fatal error. The stale eviction blocks on the
+// store mutex while a replacement is installed, reproducing the race directly.
+func TestOrderedViewStaleFatalCannotEvictReplacement(t *testing.T) {
+	t.Parallel()
+	store := newOrderedStore(newFakeOrderedSeam())
+	stale := &orderedView{namespace: viewTestNamespace}
+	replacement := &orderedView{namespace: viewTestNamespace}
+	store.views[viewTestNamespace] = stale
+	fatal := &OrderedStreamConfigError{Stream: "OI_sessions", Reason: "max age is nonzero"}
+
+	store.mu.Lock()
+	started := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		close(started)
+		store.evictRepairableFatal(viewTestNamespace, stale, fatal)
+		close(done)
+	}()
+	<-started
+	store.views[viewTestNamespace] = replacement
+	store.mu.Unlock()
+	<-done
+
+	store.mu.Lock()
+	got := store.views[viewTestNamespace]
+	store.mu.Unlock()
+	if got != replacement {
+		t.Fatalf("stale fatal eviction left view %p, want replacement %p", got, replacement)
 	}
 }
 

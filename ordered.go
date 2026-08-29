@@ -1398,7 +1398,6 @@ func (s *orderedStore) ListDue(ctx context.Context, namespace string, dueAtOrBef
 		start = view.upperBoundLocked(view.due, orderedDueBefore, probe)
 	}
 	eligible := view.dueEndLocked(dueAtOrBefore)
-	start = min(start, eligible)
 	end := min(start+limit, eligible)
 	page := storage.DuePage{Records: view.collectLocked(view.due[start:end])}
 	if end < eligible {
