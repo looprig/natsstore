@@ -1195,25 +1195,34 @@ func orderedNamespaceSpec(namespace string) (orderedStreamSpec, error) {
 }
 
 // view returns the namespace's view, starting it on first use. One view, one
-// goroutine, one subscription per OPEN namespace: a namespace becomes open when
-// it is first queried and stays open until Close.
+// goroutine, one subscription per open namespace. A healthy or corrupt-fatal
+// view stays registered until Close; a stopped config-fatal view may be retired
+// after operator repair.
 func (s *orderedStore) view(namespace string) (*orderedView, error) {
+	view, _, err := s.acquireView(namespace)
+	return view, err
+}
+
+// acquireView returns the namespace view and whether this call created it.
+// Readiness uses that provenance to distinguish a fatal inherited from a prior
+// query from one latched immediately by the goroutine this query just started.
+func (s *orderedStore) acquireView(namespace string) (*orderedView, bool, error) {
 	spec, err := orderedNamespaceSpec(namespace)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return nil, &OrderedStoreClosedError{Namespace: namespace}
+		return nil, false, &OrderedStoreClosedError{Namespace: namespace}
 	}
 	if view, ok := s.views[namespace]; ok {
-		return view, nil
+		return view, false, nil
 	}
 	view := newOrderedView(namespace, spec, s.seam, s.stats, s.viewRetryBase)
 	s.views[namespace] = view
 	view.start()
-	return view, nil
+	return view, true, nil
 }
 
 // readyView returns a view that has applied through the stream tip observed at
@@ -1221,19 +1230,38 @@ func (s *orderedStore) view(namespace string) (*orderedView, error) {
 // guarantee meaningful: a tip captured afterwards would only prove the view was
 // caught up with some earlier moment.
 func (s *orderedStore) readyView(ctx context.Context, namespace string) (*orderedView, error) {
+	view, created, err := s.acquireView(namespace)
+	if err != nil {
+		return nil, err
+	}
+	return s.readyAcquiredView(ctx, namespace, view, created)
+}
+
+// readyAcquiredView makes one acquired view ready. It is split from readyView
+// so acquisition provenance remains explicit and scheduling cannot make a new
+// view's fast fatal look inherited.
+func (s *orderedStore) readyAcquiredView(ctx context.Context, namespace string, view *orderedView, created bool) (*orderedView, error) {
 	const maxRetiredViewRestarts = 1
+	var err error
 	for restarts := 0; ; {
-		view, err := s.view(namespace)
-		if err != nil {
-			return nil, err
-		}
 		// A fatal already present when this query acquires the view belongs to a
-		// previous query. Retire a repairable stopped view and bootstrap once in
-		// this same call, so operator repair takes effect on the next query.
+		// previous query only when acquisition says the view already existed.
+		// Retire it and bootstrap once in this same call, so operator repair takes
+		// effect on the next query without hiding a newly-created view's error.
 		if fatal := view.fatalError(); fatal != nil {
-			if restarts < maxRetiredViewRestarts && s.evictRepairableFatal(ctx, namespace, view, fatal) {
-				restarts++
-				continue
+			if !created && restarts < maxRetiredViewRestarts {
+				outcome, retireErr := s.evictRepairableFatal(ctx, namespace, view, fatal)
+				if retireErr != nil {
+					return nil, retireErr
+				}
+				if outcome == orderedViewRetired || outcome == orderedViewSuperseded {
+					restarts++
+					view, created, err = s.acquireView(namespace)
+					if err != nil {
+						return nil, err
+					}
+					continue
+				}
 			}
 			return nil, fatal
 		}
@@ -1243,40 +1271,50 @@ func (s *orderedStore) readyView(ctx context.Context, namespace string) (*ordere
 			return nil, err
 		}
 		if err := view.waitBarrier(ctx, tip); err != nil {
-			s.evictRepairableFatal(ctx, namespace, view, err)
+			_, retireErr := s.evictRepairableFatal(ctx, namespace, view, err)
+			if retireErr != nil {
+				return nil, retireErr
+			}
 			return nil, err
 		}
 		return view, nil
 	}
 }
 
+type orderedViewRetireResult uint8
+
+const (
+	orderedViewNotRetired orderedViewRetireResult = iota
+	orderedViewRetired
+	orderedViewSuperseded
+)
+
 // evictRepairableFatal drops only a view whose stream configuration can be
 // repaired out of band. Corrupt record bytes remain sticky: rebuilding from
 // the same authoritative payload would deterministically fail again and should
 // not create an unbounded subscription loop.
-func (s *orderedStore) evictRepairableFatal(ctx context.Context, namespace string, view *orderedView, err error) bool {
+func (s *orderedStore) evictRepairableFatal(ctx context.Context, namespace string, view *orderedView, err error) (orderedViewRetireResult, error) {
 	var configErr *OrderedStreamConfigError
 	if !errors.As(err, &configErr) {
-		return false
+		return orderedViewNotRetired, nil
 	}
-	// setFatal cancels the view before waking barrier waiters. Do not remove its
+	// setFatal wakes barrier waiters before it cancels the view. Do not remove the
 	// last lifecycle handle until run has completed: otherwise a replacement can
 	// overlap it and a concurrent Close cannot wait for the retired goroutine.
-	// If this query gives up first, retain the view so Close or the next query can
-	// still account for it.
+	// If this query gives up first, retain the view and report its context error.
 	select {
 	case <-view.done:
 	case <-ctx.Done():
-		return false
+		return orderedViewNotRetired, ctx.Err()
 	}
 	s.mu.Lock()
-	evicted := false
 	if s.views[namespace] == view {
 		delete(s.views, namespace)
-		evicted = true
+		s.mu.Unlock()
+		return orderedViewRetired, nil
 	}
 	s.mu.Unlock()
-	return evicted
+	return orderedViewSuperseded, nil
 }
 
 // queryStats reports the query-work counters. It exists for this module's own

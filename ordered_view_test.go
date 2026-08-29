@@ -1054,6 +1054,119 @@ func TestOrderedViewNextQueryRebootsAfterCancelledEviction(t *testing.T) {
 	}
 }
 
+// TestOrderedViewCreatedFatalIsNotRetried proves acquisition provenance, not
+// goroutine scheduling, decides whether a fatal belongs to a previous query.
+// Even if a newly-created view has already latched its config error, the query
+// that created it must observe that error rather than silently retrying.
+func TestOrderedViewCreatedFatalIsNotRetried(t *testing.T) {
+	t.Parallel()
+	store := newOrderedStore(newFakeOrderedSeam())
+	done := make(chan struct{})
+	close(done)
+	fatal := &OrderedStreamConfigError{Stream: "OI_sessions", Reason: "max age is nonzero"}
+	created := &orderedView{namespace: viewTestNamespace, done: done, fatal: fatal}
+	store.views[viewTestNamespace] = created
+
+	_, err := store.readyAcquiredView(context.Background(), viewTestNamespace, created, true)
+	if !errors.As(err, new(*OrderedStreamConfigError)) {
+		t.Fatalf("ready newly-created fatal view = %T %v, want *OrderedStreamConfigError", err, err)
+	}
+	if store.views[viewTestNamespace] != created {
+		t.Fatal("newly-created fatal view was retired by its creating query")
+	}
+}
+
+// TestOrderedViewRetireCancellationReturnsContext proves retirement cancellation
+// is not misreported as the stale stream configuration error.
+func TestOrderedViewRetireCancellationReturnsContext(t *testing.T) {
+	t.Parallel()
+	store := newOrderedStore(newFakeOrderedSeam())
+	fatal := &OrderedStreamConfigError{Stream: "OI_sessions", Reason: "max age is nonzero"}
+	retained := &orderedView{namespace: viewTestNamespace, done: make(chan struct{}), fatal: fatal}
+	store.views[viewTestNamespace] = retained
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := store.readyAcquiredView(ctx, viewTestNamespace, retained, false)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ready retained fatal view with cancelled context = %T %v, want context.Canceled", err, err)
+	}
+	if store.views[viewTestNamespace] != retained {
+		t.Fatal("cancelled retirement removed the view Close must still account for")
+	}
+}
+
+// TestOrderedViewConcurrentRepairQueriesShareReplacement coordinates two
+// queries that both acquired the same stopped config-fatal view. One wins the
+// identity eviction; the loser must re-check the registry and join the same
+// replacement instead of returning the old fatal error.
+func TestOrderedViewConcurrentRepairQueriesShareReplacement(t *testing.T) {
+	t.Parallel()
+	store, f := newViewTestStore(t)
+	ctx := viewCtx(t)
+	record := liveOrderedRecord(viewID("tenant/a", "repaired"), 1, 1)
+	record.Due = dueAt(1)
+	seedOrderedRecord(t, f, record)
+	done := make(chan struct{})
+	close(done)
+	fatal := &OrderedStreamConfigError{Stream: "OI_sessions", Reason: "max age is nonzero"}
+	retired := &orderedView{namespace: viewTestNamespace, done: done, fatal: fatal}
+	store.views[viewTestNamespace] = retired
+
+	type result struct {
+		view *orderedView
+		err  error
+	}
+	start := make(chan struct{})
+	results := make(chan result, 2)
+	for range 2 {
+		go func() {
+			<-start
+			view, err := store.readyAcquiredView(ctx, viewTestNamespace, retired, false)
+			results <- result{view: view, err: err}
+		}()
+	}
+	close(start)
+	first, second := <-results, <-results
+	for index, got := range []result{first, second} {
+		if got.err != nil {
+			t.Fatalf("repair query %d: %v", index, got.err)
+		}
+		if got.view == nil || got.view == retired {
+			t.Fatalf("repair query %d returned view %p, want a replacement", index, got.view)
+		}
+	}
+	if first.view != second.view {
+		t.Fatalf("repair queries returned overlapping replacements %p and %p", first.view, second.view)
+	}
+	if starts := f.watchStartCount(); starts != 1 {
+		t.Fatalf("watchStream started %d replacements, want 1", starts)
+	}
+}
+
+// TestOrderedViewRepairRestartIsBounded proves a superseded stale view cannot
+// make one query retire an unbounded chain of config-fatal replacements.
+func TestOrderedViewRepairRestartIsBounded(t *testing.T) {
+	t.Parallel()
+	store := newOrderedStore(newFakeOrderedSeam())
+	done := make(chan struct{})
+	close(done)
+	oldFatal := &OrderedStreamConfigError{Stream: "OI_sessions", Reason: "old max age"}
+	newFatal := &OrderedStreamConfigError{Stream: "OI_sessions", Reason: "repair is still invalid"}
+	stale := &orderedView{namespace: viewTestNamespace, done: done, fatal: oldFatal}
+	current := &orderedView{namespace: viewTestNamespace, done: done, fatal: newFatal}
+	store.views[viewTestNamespace] = current
+
+	_, err := store.readyAcquiredView(context.Background(), viewTestNamespace, stale, false)
+	var configErr *OrderedStreamConfigError
+	if !errors.As(err, &configErr) || configErr != newFatal {
+		t.Fatalf("ready through config-fatal replacement = %T %v, want current fatal %v", err, err, newFatal)
+	}
+	if store.views[viewTestNamespace] != current {
+		t.Fatal("bounded restart retired the current config-fatal replacement")
+	}
+}
+
 // TestOrderedViewStaleFatalCannotEvictReplacement proves eviction is bound to
 // the view that observed the fatal error. The stale eviction blocks on the
 // store mutex while a replacement is installed, reproducing the race directly.
