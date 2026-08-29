@@ -861,11 +861,13 @@ func TestOrderedStoreCloseCancelsEveryViewBeforeWaiting(t *testing.T) {
 	for _, controlledView := range controlled {
 		select {
 		case <-controlledView.cancelObserved:
-		case <-time.After(250 * time.Millisecond):
-			cancelClose()
+		case err := <-result:
+			close(release)
+			t.Fatalf("Close returned before cancelling view %q: %v", controlledView.view.namespace, err)
+		case <-closeCtx.Done():
 			close(release)
 			err := <-result
-			t.Fatalf("Close did not cancel view %q before waiting: %v", controlledView.view.namespace, err)
+			t.Fatalf("Close context expired before cancelling view %q: %v", controlledView.view.namespace, err)
 		}
 	}
 	close(release)
@@ -963,13 +965,67 @@ func TestOrderedViewRebootsAfterRepairableConfigurationFatal(t *testing.T) {
 	}
 }
 
+// TestOrderedViewCancelledEvictionRemainsForClose proves a repairable fatal is
+// not removed from the registry until its goroutine has actually stopped. If
+// the evicting query gives up first, the existing view remains both the only
+// namespace view and part of Close's shutdown snapshot.
+func TestOrderedViewCancelledEvictionRemainsForClose(t *testing.T) {
+	t.Parallel()
+	store := newOrderedStore(newFakeOrderedSeam())
+	t.Cleanup(func() { _ = store.Close(context.Background()) })
+	done := make(chan struct{})
+	cancelObserved := make(chan struct{})
+	var cancelOnce sync.Once
+	view := &orderedView{
+		namespace: viewTestNamespace,
+		cancel:    func() { cancelOnce.Do(func() { close(cancelObserved) }) },
+		done:      done,
+	}
+	store.views[viewTestNamespace] = view
+	fatal := &OrderedStreamConfigError{Stream: "OI_sessions", Reason: "max age is nonzero"}
+	evictCtx, cancelEvict := context.WithCancel(context.Background())
+	cancelEvict()
+	store.evictRepairableFatal(evictCtx, viewTestNamespace, view, fatal)
+
+	got, err := store.view(viewTestNamespace)
+	if err != nil {
+		t.Fatalf("view after cancelled eviction: %v", err)
+	}
+	if got != view {
+		t.Fatalf("cancelled eviction installed overlapping view %p, want existing %p", got, view)
+	}
+
+	closeCtx, cancelClose := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelClose()
+	result := make(chan error, 1)
+	go func() { result <- store.Close(closeCtx) }()
+	select {
+	case <-cancelObserved:
+	case err := <-result:
+		t.Fatalf("Close returned before cancelling the retained view: %v", err)
+	case <-closeCtx.Done():
+		t.Fatalf("Close did not cancel the retained view: %v", closeCtx.Err())
+	}
+	select {
+	case err := <-result:
+		t.Fatalf("Close returned before the retained view stopped: %v", err)
+	default:
+	}
+	close(done)
+	if err := <-result; err != nil {
+		t.Fatalf("Close after retained view stopped: %v", err)
+	}
+}
+
 // TestOrderedViewStaleFatalCannotEvictReplacement proves eviction is bound to
 // the view that observed the fatal error. The stale eviction blocks on the
 // store mutex while a replacement is installed, reproducing the race directly.
 func TestOrderedViewStaleFatalCannotEvictReplacement(t *testing.T) {
 	t.Parallel()
 	store := newOrderedStore(newFakeOrderedSeam())
-	stale := &orderedView{namespace: viewTestNamespace}
+	staleDone := make(chan struct{})
+	close(staleDone)
+	stale := &orderedView{namespace: viewTestNamespace, done: staleDone}
 	replacement := &orderedView{namespace: viewTestNamespace}
 	store.views[viewTestNamespace] = stale
 	fatal := &OrderedStreamConfigError{Stream: "OI_sessions", Reason: "max age is nonzero"}
@@ -979,7 +1035,7 @@ func TestOrderedViewStaleFatalCannotEvictReplacement(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		close(started)
-		store.evictRepairableFatal(viewTestNamespace, stale, fatal)
+		store.evictRepairableFatal(context.Background(), viewTestNamespace, stale, fatal)
 		close(done)
 	}()
 	<-started
@@ -1185,6 +1241,7 @@ func TestOrderedCursorRoundTripsAndRejectsTampering(t *testing.T) {
 		{name: "zero-padded version", token: "oi01." + body, rule: storage.OrderedCursorMalformed},
 		{name: "multiply-padded version", token: "oi001." + body, rule: storage.OrderedCursorMalformed},
 		{name: "signed version", token: "oi+1." + body, rule: storage.OrderedCursorMalformed},
+		{name: "negative signed version", token: "oi-1." + body, rule: storage.OrderedCursorMalformed},
 		{name: "future version", token: "oi2." + body, rule: storage.OrderedCursorUnknownVersion},
 		{name: "zero version", token: "oi0." + body, rule: storage.OrderedCursorUnknownVersion},
 		{name: "not base64", token: "oi1.!!!!", rule: storage.OrderedCursorMalformed},

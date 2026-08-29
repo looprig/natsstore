@@ -1221,7 +1221,7 @@ func (s *orderedStore) readyView(ctx context.Context, namespace string) (*ordere
 		return nil, err
 	}
 	if err := view.waitBarrier(ctx, tip); err != nil {
-		s.evictRepairableFatal(namespace, view, err)
+		s.evictRepairableFatal(ctx, namespace, view, err)
 		return nil, err
 	}
 	return view, nil
@@ -1231,9 +1231,19 @@ func (s *orderedStore) readyView(ctx context.Context, namespace string) (*ordere
 // repaired out of band. Corrupt record bytes remain sticky: rebuilding from
 // the same authoritative payload would deterministically fail again and should
 // not create an unbounded subscription loop.
-func (s *orderedStore) evictRepairableFatal(namespace string, view *orderedView, err error) {
+func (s *orderedStore) evictRepairableFatal(ctx context.Context, namespace string, view *orderedView, err error) {
 	var configErr *OrderedStreamConfigError
 	if !errors.As(err, &configErr) {
+		return
+	}
+	// setFatal cancels the view before waking barrier waiters. Do not remove its
+	// last lifecycle handle until run has completed: otherwise a replacement can
+	// overlap it and a concurrent Close cannot wait for the retired goroutine.
+	// If this query gives up first, retain the view so Close or the next query can
+	// still account for it.
+	select {
+	case <-view.done:
+	case <-ctx.Done():
 		return
 	}
 	s.mu.Lock()

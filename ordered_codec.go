@@ -466,6 +466,11 @@ func splitOrderedCursorVersion(token string) (int, string, bool) {
 	if !ok || digits == "" {
 		return 0, "", false
 	}
+	for index := range len(digits) {
+		if digits[index] < '0' || digits[index] > '9' {
+			return 0, "", false
+		}
+	}
 	version, err := strconv.Atoi(digits)
 	if err != nil || strconv.Itoa(version) != digits {
 		return 0, "", false
