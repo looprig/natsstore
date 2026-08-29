@@ -1,7 +1,7 @@
 # natsstore
 
-`natsstore` implements [`storage`](../storage)'s four storage primitives — `Ledger`,
-`Leaser`, `KV`, and `Blobs` — over **NATS JetStream**. It is the only module in the tree
+`natsstore` implements [`storage`](../storage)'s five storage primitives — `Ledger`,
+`Leaser`, `KV`, `Blobs`, and `OrderedIndex` — over **NATS JetStream**. It is the only module in the tree
 that depends on the NATS packages; consumers depend on the neutral `storage` contracts and
 wire `natsstore` in at their composition root.
 
@@ -32,21 +32,38 @@ if err != nil {
 }
 defer st.Close(ctx)
 
-// Hand the four-primitive bundle to a facade such as sessionstore.Open.
+// Hand the complete five-primitive bundle to a facade such as sessionstore.Open.
 sess, err := sessionstore.Open(ctx, st.Composite) // or st.Backend()
 ```
 
 `Store` embeds `*storage.Composite`, so each primitive is reachable as a promoted field
-(`st.Ledger`, `st.Leaser`, `st.KV`, `st.Blobs`); the whole bundle is `st.Composite` (or
-`st.Backend()`). `Close` drains the connection and — in embedded mode — shuts the in-process
-server down afterwards; it is idempotent.
+(`st.Ledger`, `st.Leaser`, `st.KV`, `st.Blobs`, `st.OrderedIndex`); the whole bundle is
+`st.Composite` (or `st.Backend()`). `Close` first cancels and waits for every derived
+OrderedIndex namespace view, then drains the connection and — in embedded mode — shuts
+the in-process server down. It is idempotent. A queried-but-unwritten OrderedIndex
+namespace retains one retrying subscription view so a later stream can be observed; the
+view is process-local derived state, and `Close` cancels and accounts for it. Applications
+with unbounded dynamic namespaces should therefore bound or reuse namespace names rather
+than treating a read as a free probe.
 
 ## Buckets & durability
 
-The ledger provisions its stream lazily on first append; the lease KV, application KV, and
-blob object-store buckets are provisioned idempotently at `Open` (`CreateOrUpdate*`), so
+The ledger and OrderedIndex namespace streams provision lazily on first write; the lease
+KV, application KV, and blob object-store buckets are provisioned idempotently at `Open`
+(`CreateOrUpdate*`), so
 reopening the same embedded StoreDir rebinds the existing buckets and sees the persisted
 data rather than failing.
+
+OrderedIndex creates publish a two-message atomic batch (scope counter plus record) and
+serialize same-scope creators within one process. Independent handles and processes still
+coordinate through JetStream subject-sequence preconditions and bounded jittered retries.
+The pinned NATS server limits in-flight atomic batches per stream to 50. The provider does
+not add a distributed admission coordinator: deployments capable of more than 50 processes
+simultaneously creating records in one namespace should shard namespaces or externally
+bound that concurrency. A server batch-cap rejection remains a definite typed batch error
+for the caller to retry; repeated subject-sequence races exhaust the provider's bounded
+retry budget as `*OrderedContentionError`. Neither case silently weakens atomicity or order
+guarantees.
 
 ## Dependencies
 

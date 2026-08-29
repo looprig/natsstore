@@ -1,7 +1,7 @@
 package natsstore
 
-// This file is natsstore's composition root: it wires the four JetStream backends
-// (ledger, leaser, KV, blobs) over a single NATS connection into one storage
+// This file is natsstore's composition root: it wires the five JetStream backends
+// (ledger, leaser, KV, blobs, ordered index) over a single NATS connection into one storage
 // field-bundle and exposes lifecycle (Open/Close). It is the module's public entry
 // point; a consumer opens a Store here and hands its *storage.Composite to a facade
 // such as sessionstore.Open.
@@ -11,19 +11,20 @@ package natsstore
 // A Store is backed either by an EMBEDDED, in-process JetStream server (the Store owns
 // the Engine and its DontListen server under a caller-provided dir) or by a REMOTE NATS
 // URL (the Store owns only the connection). Exactly one is chosen at Open; both wire the
-// identical four-primitive Composite over the resulting connection.
+// identical five-primitive Composite over the resulting connection.
 //
-// # Why a field-bundle, not an all-four interface
+// # Why a field-bundle, not an all-five interface
 //
-// storage's four primitives collide on method names (each of Ledger, KV, and Blobs has
-// its own Delete), so NO single Go type can implement all four at once. storage solves
+// storage's primitives collide on method names (each of Ledger, KV, and Blobs has
+// its own Delete), so NO single Go type can implement all five at once. storage solves
 // this with Composite, a struct that embeds one provider per primitive. Store follows the
 // same shape (as fsstore does): it embeds *storage.Composite rather than pretending to
-// satisfy Ledger+Leaser+KV+Blobs itself. A consumer that wants the whole bundle is handed
-// store.Composite (or Backend()).
+// satisfy Ledger+Leaser+KV+Blobs+OrderedIndex itself. A consumer that wants the whole
+// bundle is handed store.Composite (or Backend()).
 
 import (
 	"context"
+	"errors"
 	"net/url"
 	"path/filepath"
 	"strconv"
@@ -84,7 +85,7 @@ func (e *ConnectError) Error() string {
 }
 func (e *ConnectError) Unwrap() error { return e.Cause }
 
-// WiringError reports that Open connected but could not assemble the four-primitive
+// WiringError reports that Open connected but could not assemble the five-primitive
 // bundle: a JetStream context could not be bound, a KV/object bucket could not be
 // provisioned, or the composite rejected a nil primitive. Component names the failed
 // step; Cause unwraps to the underlying error. On a WiringError Open tears the
@@ -189,13 +190,15 @@ func resolveMaxPayload(requested int32) (int32, error) {
 
 // Store is an open natsstore over one NATS backend — an owned embedded engine, or a
 // remote connection. It embeds *storage.Composite, so a caller reaches each primitive as
-// a promoted field (store.Ledger, store.Leaser, store.KV, store.Blobs) and hands the whole
-// bundle to a consumer as store.Composite or via Backend. The four primitives collide on
-// method names, so no single type can implement all four (see the file-level comment);
+// a promoted field (store.Ledger, store.Leaser, store.KV, store.Blobs,
+// store.OrderedIndex) and hands the whole bundle to a consumer as store.Composite or via
+// Backend. The primitives collide on
+// method names, so no single type can implement all five (see the file-level comment);
 // embedding the field-bundle is how Store sidesteps that.
 type Store struct {
 	*storage.Composite
 	pathReporter localPathReporter
+	ordered      *orderedStore
 
 	// engine is the owned embedded engine (embedded mode); conn is the owned remote
 	// connection (remote mode). Exactly one is non-nil, decided at Open, and it is what
@@ -217,7 +220,7 @@ func (s *Store) StoragePaths() []string { return s.pathReporter.StoragePaths() }
 // (Options.URL). It validates opts (*OptionsError on a bad combination), stands the
 // backend up, provisions the ledger stream lazily plus the lease/kv/object buckets
 // idempotently (so a reopen of the same embedded dir rebinds rather than fails), and wires
-// the four primitives with storage.NewComposite.
+// all five primitives with storage.NewCompositeWithOrderedIndex.
 //
 // ctx bounds the bucket-provisioning round-trips; pass a ctx with a deadline. On any
 // wiring failure Open tears the backend down (drains the connection, shuts an embedded
@@ -261,7 +264,7 @@ func openEmbedded(ctx context.Context, res resolvedOptions) (*Store, error) {
 		_ = eng.Close()
 		return nil, err
 	}
-	return &Store{Composite: comp, pathReporter: reporter, engine: eng}, nil
+	return &Store{Composite: comp, pathReporter: reporter, ordered: comp.OrderedIndex.(*orderedStore), engine: eng}, nil
 }
 
 // openRemote dials the remote URL with explicit, secure defaults (no InsecureSkipVerify;
@@ -283,7 +286,7 @@ func openRemote(ctx context.Context, res resolvedOptions) (*Store, error) {
 		conn.Close()
 		return nil, err
 	}
-	return &Store{Composite: comp, pathReporter: reporter, conn: conn}, nil
+	return &Store{Composite: comp, pathReporter: reporter, ordered: comp.OrderedIndex.(*orderedStore), conn: conn}, nil
 }
 
 // backingBuckets are the three provisioned JetStream buckets a Store's leaser, KV, and
@@ -295,10 +298,11 @@ type backingBuckets struct {
 	obj   jetstream.ObjectStore
 }
 
-// buildComposite wires the four backing stores over conn: the ledger on the legacy
+// buildComposite wires the five backing stores over conn: the ledger on the legacy
 // JetStreamContext (its expected-last-sequence publish fence lives on that API), and the
-// leaser/kv/blobs on the context-aware jetstream package (their round-trips honor ctx). It
-// returns a wiring failure as a typed *WiringError; the caller owns tearing conn down.
+// leaser/kv/blobs/ordered index on the context-aware jetstream package (their round-trips
+// honor ctx). It returns a wiring failure as a typed *WiringError; the caller owns tearing
+// conn down.
 func buildComposite(ctx context.Context, conn *nats.Conn, reporter localPathReporter) (*storage.Composite, error) {
 	jsLegacy, err := conn.JetStream()
 	if err != nil {
@@ -316,11 +320,13 @@ func buildComposite(ctx context.Context, conn *nats.Conn, reporter localPathRepo
 	leaser := newLeaserStore(newJetStreamKVSeam(buckets.lease), defaultLeaseTTL, time.Now)
 	kv := newKVStore(newJetStreamKVStoreSeam(buckets.kv))
 	blobs := newBlobStore(newJetStreamObjectSeam(buckets.obj))
+	ordered := newOrderedStore(newJetStreamOrderedSeam(conn, jsx))
 	ledger.localPathReporter = reporter
 	leaser.localPathReporter = reporter
 	kv.localPathReporter = reporter
 	blobs.localPathReporter = reporter
-	comp, err := storage.NewComposite(ledger, leaser, kv, blobs)
+	ordered.localPathReporter = reporter
+	comp, err := storage.NewCompositeWithOrderedIndex(ledger, leaser, kv, blobs, ordered)
 	if err != nil {
 		return nil, &WiringError{Component: "composite", Cause: err}
 	}
@@ -347,16 +353,17 @@ func provisionBuckets(ctx context.Context, jsx jetstream.JetStream) (backingBuck
 	return backingBuckets{lease: lease, kv: kv, obj: obj}, nil
 }
 
-// Backend returns the assembled four-primitive bundle to hand to a consumer such as
+// Backend returns the assembled five-primitive bundle to hand to a consumer such as
 // sessionstore.Open. It is the embedded *storage.Composite; callers may read
 // store.Composite directly instead.
 func (s *Store) Backend() *storage.Composite { return s.Composite }
 
-// Close tears the Store's owned backend down: it drains the connection (flushing an
+// Close first cancels and waits for every materialized OrderedIndex namespace view,
+// then tears the Store's owned backend down: it drains the connection (flushing an
 // in-flight append) and, in embedded mode, shuts the in-process server down afterwards —
-// the drain-before-shutdown ordering ported from the embedded engine's Close. It surfaces
-// the first error and is idempotent: a second call is a no-op returning nil. After Close
-// the Store must not be reused.
+// the drain-before-shutdown ordering ported from the embedded engine's Close. It joins
+// view and backend shutdown errors and is idempotent: a second call is a no-op returning
+// nil. After Close the Store must not be reused.
 //
 // ctx is accepted for contract uniformity; the drain itself is bounded by the connection's
 // drain timeout (remote: remoteDrainTimeout; embedded: the engine's default), as the
@@ -368,14 +375,18 @@ func (s *Store) Close(ctx context.Context) error {
 		return nil
 	}
 	s.closed = true
+	var orderedErr error
+	if s.ordered != nil {
+		orderedErr = s.ordered.Close(ctx)
+	}
+	var backendErr error
 	switch {
 	case s.engine != nil:
-		return s.engine.Close()
+		backendErr = s.engine.Close()
 	case s.conn != nil:
-		return s.conn.Drain()
-	default:
-		return nil
+		backendErr = s.conn.Drain()
 	}
+	return errors.Join(orderedErr, backendErr)
 }
 
 // redactURL strips any userinfo password from a NATS URL (or comma-separated URL list) so

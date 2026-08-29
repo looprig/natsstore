@@ -13,6 +13,7 @@ var (
 	_ storage.PathReporter = (*leaserStore)(nil)
 	_ storage.PathReporter = (*kvStore)(nil)
 	_ storage.PathReporter = (*blobStore)(nil)
+	_ storage.PathReporter = (*orderedStore)(nil)
 )
 
 func TestLocalPathReporter(t *testing.T) {

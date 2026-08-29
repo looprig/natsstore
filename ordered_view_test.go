@@ -1309,11 +1309,11 @@ func TestOrderedViewRejectsCorruptRecordPayloads(t *testing.T) {
 	}
 }
 
-// TestOrderedViewIgnoresCounterSubjects proves the per-scope order counters that
-// share the namespace's stream never reach a query result, and that they still
-// advance the view's watermark (they are part of the sequence a barrier waits
-// for).
-func TestOrderedViewIgnoresCounterSubjects(t *testing.T) {
+// TestOrderedViewDoesNotIndexCounterSubjects proves the per-scope order counters
+// that share the namespace's stream never become query records. Barrier
+// advancement by counter subjects is covered separately by the caught-up view
+// tests; this assertion intentionally concerns only index membership.
+func TestOrderedViewDoesNotIndexCounterSubjects(t *testing.T) {
 	t.Parallel()
 	store, _ := newViewTestStore(t)
 	ctx := viewCtx(t)

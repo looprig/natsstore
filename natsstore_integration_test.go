@@ -10,11 +10,14 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/looprig/storage"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 func TestOpenEmbeddedReportsCanonicalStoragePath(t *testing.T) {
@@ -54,6 +57,7 @@ func TestOpenEmbeddedReportsCanonicalStoragePath(t *testing.T) {
 		{name: "leaser", reporter: st.Leaser.(storage.PathReporter)},
 		{name: "kv", reporter: st.KV.(storage.PathReporter)},
 		{name: "blobs", reporter: st.Blobs.(storage.PathReporter)},
+		{name: "ordered-index", reporter: st.OrderedIndex.(storage.PathReporter)},
 	} {
 		reporters = append(reporters, candidate)
 	}
@@ -101,6 +105,7 @@ func TestOpenEmbeddedRoundtrip(t *testing.T) {
 	exerciseKV(ctx, t, st)
 	exerciseBlobs(ctx, t, st)
 	exerciseLeaser(ctx, t, st)
+	exerciseOrderedIndex(ctx, t, st)
 
 	if err := st.Close(ctx); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -122,6 +127,172 @@ func TestOpenEmbeddedRoundtrip(t *testing.T) {
 	}
 	if tip != 1 {
 		t.Errorf("reopen ledger tip = %d, want 1 (StoreDir not durable)", tip)
+	}
+	id := storage.OrderedID{Namespace: "sessions", OrderingScope: "acceptance", StableKey: "command/A:B_1"}
+	reopened, err := st2.OrderedIndex.Get(ctx, id)
+	if err != nil {
+		t.Fatalf("reopen OrderedIndex.Get: %v", err)
+	}
+	if reopened.Order == 0 || string(reopened.Value) != "ordered-value" {
+		t.Errorf("reopened ordered record = {Order:%d Value:%q}, want nonzero order and %q", reopened.Order, reopened.Value, "ordered-value")
+	}
+}
+
+func exerciseOrderedIndex(ctx context.Context, t *testing.T, st *Store) {
+	t.Helper()
+	if st.OrderedIndex == nil {
+		t.Fatal("Open returned a composite with nil OrderedIndex")
+	}
+	id := storage.OrderedID{Namespace: "sessions", OrderingScope: "acceptance", StableKey: "command/A:B_1"}
+	record, created, err := st.OrderedIndex.Create(ctx, id, "workers", []byte("ordered-value"), storage.Rank{Ranked: true, Value: 7}, storage.Due{State: storage.DueAt, UnixMillis: 9})
+	if err != nil || !created {
+		t.Fatalf("OrderedIndex.Create = created %v, err %v", created, err)
+	}
+	page, err := st.OrderedIndex.ListOrdered(ctx, "sessions", "acceptance", 0, 1)
+	if err != nil {
+		t.Fatalf("OrderedIndex.ListOrdered: %v", err)
+	}
+	if len(page.Records) != 1 || page.Records[0].ID != id || page.Records[0].Order != record.Order {
+		t.Errorf("OrderedIndex.ListOrdered = %+v, want created record %+v", page.Records, record)
+	}
+}
+
+func TestOrderedIndexMultiHandleConcurrentOrder(t *testing.T) {
+	dir := t.TempDir()
+	eng, err := openEngineAt(dir, 0, maxPayload)
+	if err != nil {
+		t.Fatalf("open engine: %v", err)
+	}
+	leftJS, err := jetstream.New(eng.Conn())
+	if err != nil {
+		_ = eng.Close()
+		t.Fatalf("jetstream.New: %v", err)
+	}
+	rightConn, err := nats.Connect("", nats.InProcessServer(eng.srv), nats.Name("natsstore-multi-handle-right"))
+	if err != nil {
+		_ = eng.Close()
+		t.Fatalf("connect second client: %v", err)
+	}
+	rightJS, err := jetstream.New(rightConn)
+	if err != nil {
+		rightConn.Close()
+		_ = eng.Close()
+		t.Fatalf("jetstream.New(second client): %v", err)
+	}
+	left := newOrderedStore(newJetStreamOrderedSeam(eng.Conn(), leftJS))
+	right := newOrderedStore(newJetStreamOrderedSeam(rightConn, rightJS))
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	t.Cleanup(func() {
+		_ = left.Close(context.Background())
+		_ = right.Close(context.Background())
+		rightConn.Close()
+		_ = eng.Close()
+	})
+
+	const writers = 100
+	type result struct {
+		record storage.OrderedRecord
+		err    error
+	}
+	results := make(chan result, writers)
+	start := make(chan struct{})
+	for i := range writers {
+		index := left
+		if i%2 != 0 {
+			index = right
+		}
+		go func(i int, index *orderedStore) {
+			<-start
+			id := storage.OrderedID{Namespace: "sessions", OrderingScope: "acceptance", StableKey: storage.StableKey("multi-" + strconv.Itoa(i))}
+			record, created, err := index.Create(ctx, id, "workers", []byte("value"), storage.Rank{}, storage.Due{State: storage.NotDue})
+			if err == nil && !created {
+				err = errors.New("distinct create reported created=false")
+			}
+			results <- result{record: record, err: err}
+		}(i, index)
+	}
+	close(start)
+	orders := make(map[uint64]struct{}, writers)
+	for range writers {
+		result := <-results
+		if result.err != nil {
+			t.Fatalf("concurrent Create: %v", result.err)
+		}
+		if result.record.Order == 0 {
+			t.Fatal("concurrent Create returned zero order")
+		}
+		if _, duplicate := orders[result.record.Order]; duplicate {
+			t.Fatalf("duplicate order %d across independent handles", result.record.Order)
+		}
+		orders[result.record.Order] = struct{}{}
+	}
+	page, err := left.ListOrdered(ctx, "sessions", "acceptance", 0, writers)
+	if err != nil {
+		t.Fatalf("ListOrdered: %v", err)
+	}
+	if len(page.Records) != writers {
+		t.Fatalf("ListOrdered returned %d records, want %d", len(page.Records), writers)
+	}
+	for i := 1; i < len(page.Records); i++ {
+		if page.Records[i].Order <= page.Records[i-1].Order {
+			t.Fatalf("orders are not strictly increasing at %d: %d then %d", i, page.Records[i-1].Order, page.Records[i].Order)
+		}
+	}
+}
+
+// TestStoreCloseStopsOrderedView proves the public Store lifecycle owns the
+// derived OrderedIndex views: Close cancels their subscriptions, waits for each
+// done signal, refuses later queries, and remains idempotent.
+func TestStoreCloseStopsOrderedView(t *testing.T) {
+	fake := newFakeOrderedSeam()
+	ordered := newOrderedStore(fake)
+	ordered.retryBase = 0
+	ordered.viewRetryBase = time.Millisecond
+	st := &Store{Composite: &storage.Composite{OrderedIndex: ordered}, ordered: ordered}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	id := storage.OrderedID{Namespace: "sessions", OrderingScope: "acceptance", StableKey: "one"}
+	if _, created, err := ordered.Create(ctx, id, "workers", []byte("value"), storage.Rank{}, storage.Due{State: storage.NotDue}); err != nil || !created {
+		t.Fatalf("Create = created %v, err %v", created, err)
+	}
+	if _, err := ordered.ListDue(ctx, "sessions", 100, "", 1); err != nil {
+		t.Fatalf("ListDue: %v", err)
+	}
+	// A read of an unwritten namespace starts the same retrying subscription
+	// lifecycle even though its stream has not been provisioned yet.
+	if page, err := ordered.ListDue(ctx, "empty", 100, "", 1); err != nil || len(page.Records) != 0 {
+		t.Fatalf("ListDue(unwritten namespace) = records %d, err %v; want empty page, nil", len(page.Records), err)
+	}
+	ordered.mu.Lock()
+	views := make([]*orderedView, 0, len(ordered.views))
+	for _, view := range ordered.views {
+		views = append(views, view)
+	}
+	ordered.mu.Unlock()
+	if got := fake.watcherCount(); got != 2 || len(views) != 2 {
+		t.Fatalf("before Close: watchers=%d views=%d, want 2 and 2", got, len(views))
+	}
+
+	if err := st.Close(ctx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got := fake.watcherCount(); got != 0 {
+		t.Errorf("watchers after Close = %d, want 0", got)
+	}
+	for _, view := range views {
+		select {
+		case <-view.done:
+		default:
+			t.Errorf("view %q done is open after Store.Close returned", view.namespace)
+		}
+	}
+	if _, err := ordered.ListDue(ctx, "sessions", 100, "", 1); !errors.As(err, new(*OrderedStoreClosedError)) {
+		t.Errorf("ListDue after Close = %T %v, want *OrderedStoreClosedError", err, err)
+	}
+	if err := st.Close(ctx); err != nil {
+		t.Errorf("second Close = %v, want nil", err)
 	}
 }
 

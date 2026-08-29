@@ -16,6 +16,86 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 )
 
+type orderedCursorProbe struct{}
+
+func (orderedCursorProbe) MalformedCursor(t *testing.T, kind storage.OrderedCursorKind) string {
+	t.Helper()
+	return orderedMalformedCursorToken(kind)
+}
+
+func (orderedCursorProbe) UnknownVersionCursor(t *testing.T, kind storage.OrderedCursorKind) string {
+	t.Helper()
+	return orderedUnknownVersionCursorToken(kind)
+}
+
+func newOrderedBackend(t *testing.T, root string, counter *atomic.Uint64) *orderedStore {
+	t.Helper()
+	n := counter.Add(1)
+	dir := filepath.Join(root, "oi"+strconv.FormatUint(n, 10), "jetstream")
+	eng, err := OpenEngine(EngineOptions{DataDir: dir, SyncInterval: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("Open engine: %v", err)
+	}
+	jsx, err := jetstream.New(eng.Conn())
+	if err != nil {
+		_ = eng.Close()
+		t.Fatalf("jetstream.New: %v", err)
+	}
+	index := newOrderedStore(newJetStreamOrderedSeam(eng.Conn(), jsx))
+	t.Cleanup(func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := index.Close(closeCtx); err != nil {
+			t.Errorf("close ordered index: %v", err)
+		}
+		if err := eng.Close(); err != nil {
+			t.Errorf("close engine: %v", err)
+		}
+	})
+	return index
+}
+
+func TestOrderedIndexConformance(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", root)
+	var counter atomic.Uint64
+	factory := func(t *testing.T) storage.OrderedIndex {
+		return newOrderedBackend(t, root, &counter)
+	}
+	boundedWork := storetest.OrderedIndexCounterFunc(func(t *testing.T, ctx context.Context, index storage.OrderedIndex) {
+		ordered := index.(*orderedStore)
+		const records = 256
+		const limit = 3
+		for i := range records {
+			id := storage.OrderedID{Namespace: "sessions", OrderingScope: "acceptance", StableKey: storage.StableKey("key-" + strconv.Itoa(i))}
+			if _, created, err := ordered.Create(ctx, id, "workers", []byte("value"), storage.Rank{Ranked: true, Value: int64(i)}, storage.Due{State: storage.DueAt, UnixMillis: int64(i)}); err != nil || !created {
+				t.Fatalf("Create(%s) = created %v, err %v", id.StableKey, created, err)
+			}
+		}
+		if _, err := ordered.ListDue(ctx, "sessions", records-1, "", limit); err != nil {
+			t.Fatalf("warm ListDue: %v", err)
+		}
+		before := ordered.queryStats()
+		if _, err := ordered.ListDue(ctx, "sessions", records-1, "", limit); err != nil {
+			t.Fatalf("measured ListDue: %v", err)
+		}
+		after := ordered.queryStats()
+		if got := after.MessagesApplied - before.MessagesApplied; got != 0 {
+			t.Errorf("warm ListDue applied %d stream messages, want 0", got)
+		}
+		if got := after.StreamTipReads - before.StreamTipReads; got != 1 {
+			t.Errorf("warm ListDue read the stream tip %d times, want 1", got)
+		}
+		if got := after.RecordsCopied - before.RecordsCopied; got != limit {
+			t.Errorf("warm ListDue copied %d records, want %d", got, limit)
+		}
+		if got := after.IndexVisited - before.IndexVisited; got > 48 {
+			t.Errorf("warm ListDue visited %d index entries over %d records for limit %d, want at most 48", got, records, limit)
+		}
+	})
+	storetest.TestOrderedIndex(t, factory, orderedCursorProbe{}, boundedWork)
+}
+
 // TestLedgerConformance runs the full storage ledger conformance suite against the
 // JetStream-backed ledger over an embedded, in-process engine (no network). Every
 // factory call stands up a FRESH engine on its own StoreDir (a unique subdirectory
