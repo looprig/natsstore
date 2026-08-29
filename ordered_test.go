@@ -71,11 +71,11 @@ func (f *fakeOrderedSeam) lastMsgForSubject(_ context.Context, _ string, subject
 	return msg.seq, bytes.Clone(msg.data), nil
 }
 
-func (f *fakeOrderedSeam) publish(ctx context.Context, msg orderedMsg) error {
-	return f.publishBatch(ctx, []orderedMsg{msg})
+func (f *fakeOrderedSeam) publish(ctx context.Context, stream string, msg orderedMsg) error {
+	return f.publishBatch(ctx, stream, []orderedMsg{msg})
 }
 
-func (f *fakeOrderedSeam) publishBatch(_ context.Context, msgs []orderedMsg) error {
+func (f *fakeOrderedSeam) publishBatch(_ context.Context, _ string, msgs []orderedMsg) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	recorded := make([]orderedMsg, 0, len(msgs))
@@ -1090,5 +1090,36 @@ func TestOrderedScopeLatchIsReleased(t *testing.T) {
 	store.mu.Unlock()
 	if idle != 0 {
 		t.Fatalf("idle latches = %d, want the scope dropped", idle)
+	}
+}
+
+// TestOrderedCreateAmbiguityProvesOwnWrite pins the honest answer to a FIRST
+// Create whose acknowledgement was lost: the record read back is byte-identical
+// to the one this call tried to write, which proves the write landed, so
+// created=true. Reporting created=false there fails any conformance assertion
+// that exactly one of N concurrent creators sees created=true.
+func TestOrderedCreateAmbiguityProvesOwnWrite(t *testing.T) {
+	t.Parallel()
+	f := newFakeOrderedSeam()
+	store := newOrderedStore(f)
+	id := orderedTestID()
+	f.hook = func(f *fakeOrderedSeam, msgs []orderedMsg) error {
+		f.hook = nil
+		// The batch DID commit; only the acknowledgement was lost.
+		if err := f.applyLocked(msgs); err != nil {
+			return err
+		}
+		return errOrderedAmbiguous
+	}
+	got, created, err := store.Create(context.Background(), id, "catalog", []byte("v"),
+		storage.Rank{Ranked: true, Value: 3}, storage.Due{State: storage.DueAt, UnixMillis: 7})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if !created {
+		t.Fatal("created=false although the record read back is the one this call wrote")
+	}
+	if got.Order != 1 || got.Revision != 1 {
+		t.Fatalf("Create returned order=%d revision=%d, want 1/1", got.Order, got.Revision)
 	}
 }

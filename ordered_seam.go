@@ -85,7 +85,10 @@ func (e *OrderedStreamConfigError) Error() string {
 }
 
 // OrderedBatchRejectedError reports an atomic batch the server rejected for a
-// reason other than a failed sequence fence. No message in the batch committed.
+// reason other than a failed sequence fence, or one this seam refused to send at
+// all. No message in the batch committed — that is the whole meaning of the
+// type, and it is why an acknowledged-but-unexpected commit is NOT reported with
+// it (see OrderedBatchAckMismatchError).
 type OrderedBatchRejectedError struct {
 	BatchID     string
 	Code        int
@@ -97,6 +100,38 @@ func (e *OrderedBatchRejectedError) Error() string {
 	return "natsstore: ordered batch " + strconv.Quote(e.BatchID) + " rejected: code=" +
 		strconv.Itoa(e.Code) + " err_code=" + strconv.FormatUint(uint64(e.ErrCode), 10) +
 		" " + strconv.Quote(e.Description)
+}
+
+// OrderedBatchAckMismatchError reports a batch the server ACKNOWLEDGED — the
+// acknowledgement carries no error, so something committed — whose reported
+// member count is not the one this seam sent. The batch is neither cleanly
+// committed nor cleanly rejected, so the seam joins this with errOrderedAmbiguous
+// and lets the caller's read-back settle it. Reporting it as a rejection would
+// invert the fact and turn a write that landed into a definite failure, which is
+// the single misclassification this whole design exists to avoid.
+type OrderedBatchAckMismatchError struct {
+	BatchID   string
+	Committed uint64
+	Sent      uint64
+}
+
+func (e *OrderedBatchAckMismatchError) Error() string {
+	return "natsstore: ordered batch " + strconv.Quote(e.BatchID) +
+		" was acknowledged with " + strconv.FormatUint(e.Committed, 10) +
+		" of " + strconv.FormatUint(e.Sent, 10) + " messages; the outcome is unknown"
+}
+
+// OrderedBatchSubjectsError reports a batch naming one subject twice. Each
+// member carries its OWN expected-last-subject-sequence, so two members on one
+// subject cannot both have a meaningful fence: the second would be evaluated
+// against a sequence the first is about to change. The seam refuses to send such
+// a batch rather than let a future caller discover it as a silent mis-commit.
+type OrderedBatchSubjectsError struct {
+	Subject string
+}
+
+func (e *OrderedBatchSubjectsError) Error() string {
+	return "natsstore: ordered batch names subject " + strconv.Quote(e.Subject) + " more than once"
 }
 
 // orderedAPIError mirrors the server's ApiError as it appears inside a publish
@@ -324,7 +359,7 @@ func (s *jetStreamOrderedSeam) lastMsgForSubject(ctx context.Context, streamName
 
 // publish commits one fenced message, translating the server's rejection onto
 // errOrderedPrecondition and a lost acknowledgement onto errOrderedAmbiguous.
-func (s *jetStreamOrderedSeam) publish(ctx context.Context, msg orderedMsg) error {
+func (s *jetStreamOrderedSeam) publish(ctx context.Context, streamName string, msg orderedMsg) error {
 	m := nats.NewMsg(msg.subject)
 	m.Data = msg.data
 	if _, err := s.js.PublishMsg(ctx, m, jetstream.WithExpectLastSequencePerSubject(msg.expectLastSeq)); err != nil {
@@ -334,7 +369,7 @@ func (s *jetStreamOrderedSeam) publish(ctx context.Context, msg orderedMsg) erro
 		if isOrderedAmbiguous(err) {
 			return errors.Join(errOrderedAmbiguous, err)
 		}
-		return err
+		return &OrderedStreamOpError{Stream: streamName, Op: "publish", Cause: err}
 	}
 	return nil
 }
@@ -345,9 +380,16 @@ func (s *jetStreamOrderedSeam) publish(ctx context.Context, msg orderedMsg) erro
 // the batch's single acknowledgement. Each member keeps its OWN
 // expected-last-subject-sequence, which is why the counter and the record can be
 // fenced independently — and why no batch may ever name one subject twice.
-func (s *jetStreamOrderedSeam) publishBatch(ctx context.Context, msgs []orderedMsg) error {
+func (s *jetStreamOrderedSeam) publishBatch(ctx context.Context, streamName string, msgs []orderedMsg) error {
 	if len(msgs) == 0 {
 		return &OrderedBatchRejectedError{Description: "batch has no messages"}
+	}
+	seen := make(map[string]struct{}, len(msgs))
+	for _, m := range msgs {
+		if _, dup := seen[m.subject]; dup {
+			return &OrderedBatchSubjectsError{Subject: m.subject}
+		}
+		seen[m.subject] = struct{}{}
 	}
 	id := s.nextBatchID()
 	for i, m := range msgs {
@@ -361,7 +403,7 @@ func (s *jetStreamOrderedSeam) publishBatch(ctx context.Context, msgs []orderedM
 			// A local publish failure means the commit below never happens, so the
 			// batch cannot have committed: it is definite, not ambiguous.
 			if err := s.nc.PublishMsg(msg); err != nil {
-				return &OrderedStreamOpError{Op: "batch member publish", Cause: err}
+				return &OrderedStreamOpError{Stream: streamName, Op: "batch member publish", Cause: err}
 			}
 			continue
 		}
@@ -371,29 +413,47 @@ func (s *jetStreamOrderedSeam) publishBatch(ctx context.Context, msgs []orderedM
 			if isOrderedAmbiguous(err) {
 				return errors.Join(errOrderedAmbiguous, err)
 			}
-			return &OrderedStreamOpError{Op: "batch commit", Cause: err}
+			// The members published above are already staged on the server under
+			// this batch id and hold one of its MaxBatchInflightPerStream slots
+			// until its cleanup timer fires. That is bounded and self-healing, but
+			// it is real budget: a caller that retries a failing commit in a tight
+			// loop can exhaust the per-stream slots, which the server then reports
+			// to LATER batches. It is one more reason Create waits between attempts.
+			return &OrderedStreamOpError{Stream: streamName, Op: "batch commit", Cause: err}
 		}
 		var ack orderedBatchAck
 		if err := json.Unmarshal(reply.Data, &ack); err != nil {
-			return &OrderedStreamOpError{Op: "batch commit ack decode", Cause: err}
+			return &OrderedStreamOpError{Stream: streamName, Op: "batch commit ack decode", Cause: err}
 		}
-		if ack.Error != nil {
-			if isOrderedWrongLastSeqCode(ack.Error.ErrCode) {
-				return errOrderedPrecondition
-			}
-			return &OrderedBatchRejectedError{
-				BatchID:     id,
-				Code:        ack.Error.Code,
-				ErrCode:     ack.Error.ErrCode,
-				Description: ack.Error.Description,
-			}
+		return classifyOrderedBatchAck(id, uint64(len(msgs)), ack)
+	}
+	return nil
+}
+
+// classifyOrderedBatchAck maps a decoded commit acknowledgement onto the seam's
+// three outcomes. It is a pure function so the classification — the part that
+// decides whether a caller sees a definite failure or reads the record back — is
+// testable without a server.
+func classifyOrderedBatchAck(id string, sent uint64, ack orderedBatchAck) error {
+	if ack.Error != nil {
+		if isOrderedWrongLastSeqCode(ack.Error.ErrCode) {
+			return errOrderedPrecondition
 		}
-		if ack.BatchSize != uint64(len(msgs)) {
-			return &OrderedBatchRejectedError{
-				BatchID:     id,
-				Description: "server committed " + strconv.FormatUint(ack.BatchSize, 10) + " of " + strconv.Itoa(len(msgs)) + " messages",
-			}
+		return &OrderedBatchRejectedError{
+			BatchID:     id,
+			Code:        ack.Error.Code,
+			ErrCode:     ack.Error.ErrCode,
+			Description: ack.Error.Description,
 		}
+	}
+	// No error means the server committed. A count that is not the one we sent is
+	// therefore NOT a rejection: some prefix of the batch may be durable. Ambiguity
+	// is the only honest classification, and the caller resolves it by reading the
+	// record back — which also makes this the safe direction to be wrong in.
+	if ack.BatchSize != sent {
+		return errors.Join(errOrderedAmbiguous, &OrderedBatchAckMismatchError{
+			BatchID: id, Committed: ack.BatchSize, Sent: sent,
+		})
 	}
 	return nil
 }

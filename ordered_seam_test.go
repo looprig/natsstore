@@ -222,9 +222,117 @@ func TestJetStreamOrderedSeamBatchIDsAreGloballyUnique(t *testing.T) {
 func TestJetStreamOrderedSeamRejectsEmptyBatch(t *testing.T) {
 	t.Parallel()
 	seam := newJetStreamOrderedSeam(nil, nil)
-	err := seam.publishBatch(context.Background(), nil)
+	err := seam.publishBatch(context.Background(), "OI_x", nil)
 	var rejected *OrderedBatchRejectedError
 	if !errors.As(err, &rejected) {
 		t.Fatalf("error = %v (%T), want *OrderedBatchRejectedError", err, err)
+	}
+}
+
+// TestClassifyOrderedBatchAck pins the classification the whole ordered design
+// turns on: a batch the server ACKNOWLEDGED never yields a definite failure,
+// because some prefix of it may be durable.
+func TestClassifyOrderedBatchAck(t *testing.T) {
+	t.Parallel()
+	const id = "ns-test-1"
+	cases := []struct {
+		name      string
+		sent      uint64
+		ack       orderedBatchAck
+		wantErr   error
+		wantTyped bool
+	}{
+		{name: "committed", sent: 2, ack: orderedBatchAck{BatchSize: 2}},
+		{
+			name:    "fence lost",
+			sent:    2,
+			ack:     orderedBatchAck{Error: &orderedAPIError{Code: 400, ErrCode: uint16(jetstream.JSErrCodeStreamWrongLastSequence)}},
+			wantErr: errOrderedPrecondition,
+		},
+		{
+			name:    "replicated fence lost",
+			sent:    2,
+			ack:     orderedBatchAck{Error: &orderedAPIError{Code: 400, ErrCode: uint16(jetstream.JSErrCodeStreamWrongLastSequenceConstant)}},
+			wantErr: errOrderedPrecondition,
+		},
+		{
+			name:      "rejected",
+			sent:      2,
+			ack:       orderedBatchAck{Error: &orderedAPIError{Code: 400, ErrCode: 10176, Description: "atomic publish batch is incomplete"}},
+			wantTyped: true,
+		},
+		{name: "short commit", sent: 2, ack: orderedBatchAck{BatchSize: 1}, wantErr: errOrderedAmbiguous},
+		{name: "long commit", sent: 2, ack: orderedBatchAck{BatchSize: 3}, wantErr: errOrderedAmbiguous},
+		{name: "zero commit", sent: 2, ack: orderedBatchAck{BatchSize: 0}, wantErr: errOrderedAmbiguous},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := classifyOrderedBatchAck(id, tc.sent, tc.ack)
+			switch {
+			case tc.wantTyped:
+				var rejected *OrderedBatchRejectedError
+				if !errors.As(err, &rejected) {
+					t.Fatalf("error = %v (%T), want *OrderedBatchRejectedError", err, err)
+				}
+				if rejected.BatchID != id || rejected.Description != tc.ack.Error.Description {
+					t.Fatalf("rejected = %+v, want the batch id and the server description", rejected)
+				}
+				// A rejection must never be mistaken for either of the two outcomes
+				// the store handles specially.
+				if errors.Is(err, errOrderedAmbiguous) || errors.Is(err, errOrderedPrecondition) {
+					t.Fatalf("a rejection was also classified as ambiguous or a fence loss: %v", err)
+				}
+			case tc.wantErr == nil:
+				if err != nil {
+					t.Fatalf("error = %v, want nil", err)
+				}
+			default:
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("error = %v, want one wrapping %v", err, tc.wantErr)
+				}
+			}
+			// An acknowledged batch is never reported as "rejected", whose contract
+			// is that nothing committed.
+			if tc.ack.Error == nil {
+				var rejected *OrderedBatchRejectedError
+				if errors.As(err, &rejected) {
+					t.Fatalf("an acknowledged batch was reported as rejected: %v", err)
+				}
+			}
+			if errors.Is(err, errOrderedAmbiguous) {
+				var mismatch *OrderedBatchAckMismatchError
+				if !errors.As(err, &mismatch) {
+					t.Fatalf("ambiguous error %v carries no *OrderedBatchAckMismatchError", err)
+				}
+				if mismatch.Sent != tc.sent || mismatch.Committed != tc.ack.BatchSize {
+					t.Fatalf("mismatch = %+v, want sent=%d committed=%d", mismatch, tc.sent, tc.ack.BatchSize)
+				}
+				if msg := mismatch.Error(); !strings.Contains(msg, "unknown") {
+					t.Fatalf("Error() = %q, want it to say the outcome is unknown", msg)
+				}
+			}
+		})
+	}
+}
+
+// TestJetStreamOrderedSeamRejectsRepeatedSubject pins the F4.1 constraint that a
+// batch may not name one subject twice: each member carries its own fence, so
+// the second could only be evaluated against a sequence the first is about to
+// change.
+func TestJetStreamOrderedSeamRejectsRepeatedSubject(t *testing.T) {
+	t.Parallel()
+	seam := newJetStreamOrderedSeam(nil, nil)
+	// A nil connection would panic on a publish, so reaching the guard is itself
+	// the assertion that nothing was sent.
+	err := seam.publishBatch(context.Background(), "OI_x", []orderedMsg{
+		{subject: "oi.x.a"}, {subject: "oi.x.b"}, {subject: "oi.x.a"},
+	})
+	var subjects *OrderedBatchSubjectsError
+	if !errors.As(err, &subjects) {
+		t.Fatalf("error = %v (%T), want *OrderedBatchSubjectsError", err, err)
+	}
+	if subjects.Subject != "oi.x.a" {
+		t.Fatalf("Subject = %q, want %q", subjects.Subject, "oi.x.a")
 	}
 }

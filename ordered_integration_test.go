@@ -205,7 +205,7 @@ func TestOrderedStoreForgedPayloadFailsClosedOnServer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encodeOrderedRecord: %v", err)
 	}
-	if err := seam.publish(ctx, orderedMsg{subject: victimSubj, data: forged, expectLastSeq: seq}); err != nil {
+	if err := seam.publish(ctx, spec.stream, orderedMsg{subject: victimSubj, data: forged, expectLastSeq: seq}); err != nil {
 		t.Fatalf("publish forged record: %v", err)
 	}
 

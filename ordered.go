@@ -111,10 +111,11 @@ type orderedSeam interface {
 	lastMsgForSubject(ctx context.Context, stream, subject string) (seq uint64, data []byte, err error)
 	// publish commits one fenced message. It returns errOrderedPrecondition when
 	// the fence fails and errOrderedAmbiguous when the acknowledgement is lost.
-	publish(ctx context.Context, msg orderedMsg) error
+	publish(ctx context.Context, stream string, msg orderedMsg) error
 	// publishBatch commits every message atomically under its own fence, with the
-	// same two sentinels. A rejected batch commits nothing.
-	publishBatch(ctx context.Context, msgs []orderedMsg) error
+	// same two sentinels. A rejected batch commits nothing. stream names the
+	// stream the subjects live in, so a failure can say which one it was.
+	publishBatch(ctx context.Context, stream string, msgs []orderedMsg) error
 }
 
 // orderedStore implements the mutating half of storage.OrderedIndex over one
@@ -359,7 +360,7 @@ func (s *orderedStore) Create(ctx context.Context, id storage.OrderedID, ranking
 		// Two subjects, two independent expectations: the counter must still be
 		// where we read it, and the record subject must not exist at all. They are
 		// necessarily distinct subjects — one batch cannot fence one subject twice.
-		err = s.seam.publishBatch(ctx, []orderedMsg{
+		err = s.seam.publishBatch(ctx, spec.stream, []orderedMsg{
 			{subject: counterSubj, data: encodeOrderedCounter(rec.Order), expectLastSeq: counterSeq},
 			{subject: recordSubj, data: payload, expectLastSeq: 0},
 		})
@@ -385,10 +386,15 @@ func (s *orderedStore) Create(ctx context.Context, id storage.OrderedID, ranking
 				return storage.OrderedRecord{}, false, readErr
 			}
 			if ok {
-				// The identity exists, so a retry of Create is satisfied by the
-				// canonical record. Whether this call or a concurrent one wrote it is
-				// unknowable, so it is reported as a duplicate.
-				return winner, false, nil
+				// The identity exists either way, so the canonical record is the
+				// answer; what is left to decide is created. A stored record identical
+				// to the one this call submitted is proof the submitted write landed,
+				// which is exactly how commitRevision resolves the same ambiguity, so
+				// report the creation honestly instead of downgrading a successful
+				// first Create to a duplicate. The residual imprecision is narrow and
+				// accepted: two creators submitting byte-identical records that were
+				// also assigned the same order would both report created=true.
+				return winner, orderedRecordEqual(winner, rec), nil
 			}
 			return storage.OrderedRecord{}, false, &storage.OrderedAmbiguousError{
 				Operation: storage.OrderedCreateOperation, ID: id, Cause: err,
@@ -486,7 +492,7 @@ func (s *orderedStore) commitRevision(ctx context.Context, stream, subject strin
 	if err != nil {
 		return storage.OrderedRecord{}, err
 	}
-	err = s.seam.publish(ctx, orderedMsg{subject: subject, data: payload, expectLastSeq: expectSeq})
+	err = s.seam.publish(ctx, stream, orderedMsg{subject: subject, data: payload, expectLastSeq: expectSeq})
 	switch {
 	case err == nil:
 		// As in Create: the returned record must not alias the caller's slice.
