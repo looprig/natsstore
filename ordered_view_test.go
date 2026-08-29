@@ -882,6 +882,32 @@ func TestOrderedStoreCloseCancelsEveryViewBeforeWaiting(t *testing.T) {
 	}
 }
 
+// TestOrderedStoreCloseJoinsEveryStopError pins the error-aggregation half of
+// shutdown separately from cancellation ordering. Neither inert view can stop,
+// so an expired context must produce one named timeout for each namespace.
+func TestOrderedStoreCloseJoinsEveryStopError(t *testing.T) {
+	t.Parallel()
+	store := newOrderedStore(newFakeOrderedSeam())
+	for _, namespace := range []string{"sessions", "archive"} {
+		store.views[namespace] = &orderedView{
+			namespace: namespace,
+			cancel:    func() {},
+			done:      make(chan struct{}),
+		}
+	}
+	closeCtx, cancelClose := context.WithCancel(context.Background())
+	cancelClose()
+	err := store.Close(closeCtx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Close(expired context) = %T %v, want context.Canceled", err, err)
+	}
+	for _, namespace := range []string{"sessions", "archive"} {
+		if !strings.Contains(err.Error(), strconv.Quote(namespace)) {
+			t.Errorf("Close error %q does not include failed view %q", err, namespace)
+		}
+	}
+}
+
 // TestOrderedViewFatalConfigurationFailsQueriesImmediately proves a namespace
 // whose stream cannot ever serve this layout reports that fact instead of
 // blocking every reader until their deadlines expire.
