@@ -44,7 +44,13 @@ type fakeOrderedSeam struct {
 	hook func(f *fakeOrderedSeam, msgs []orderedMsg) error
 
 	ensureErr error
-	getErr    error
+
+	// getErr, once failGetAfter successful reads have been served, is returned by
+	// every subsequent lastMsgForSubject. failGetAfter=0 fails from the first
+	// read, which is the common case.
+	getErr       error
+	failGetAfter int
+	gets         int
 }
 
 func newFakeOrderedSeam() *fakeOrderedSeam {
@@ -61,7 +67,8 @@ func (f *fakeOrderedSeam) ensureStream(_ context.Context, spec orderedStreamSpec
 func (f *fakeOrderedSeam) lastMsgForSubject(_ context.Context, _ string, subject string) (uint64, []byte, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.getErr != nil {
+	f.gets++
+	if f.getErr != nil && f.gets > f.failGetAfter {
 		return 0, nil, f.getErr
 	}
 	msg, ok := f.msgs[subject]
@@ -951,6 +958,37 @@ func TestOrderedLostCASAgainstConcurrentDelete(t *testing.T) {
 	})
 }
 
+// TestOrderedCreateAmbiguityProvesOwnWrite pins the honest answer to a FIRST
+// Create whose acknowledgement was lost: the record read back is byte-identical
+// to the one this call tried to write, which proves the write landed, so
+// created=true. Reporting created=false there fails any conformance assertion
+// that exactly one of N concurrent creators sees created=true.
+func TestOrderedCreateAmbiguityProvesOwnWrite(t *testing.T) {
+	t.Parallel()
+	f := newFakeOrderedSeam()
+	store := newOrderedStore(f)
+	id := orderedTestID()
+	f.hook = func(f *fakeOrderedSeam, msgs []orderedMsg) error {
+		f.hook = nil
+		// The batch DID commit; only the acknowledgement was lost.
+		if err := f.applyLocked(msgs); err != nil {
+			return err
+		}
+		return errOrderedAmbiguous
+	}
+	got, created, err := store.Create(context.Background(), id, "catalog", []byte("v"),
+		storage.Rank{Ranked: true, Value: 3}, storage.Due{State: storage.DueAt, UnixMillis: 7})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if !created {
+		t.Fatal("created=false although the record read back is the one this call wrote")
+	}
+	if got.Order != 1 || got.Revision != 1 {
+		t.Fatalf("Create returned order=%d revision=%d, want 1/1", got.Order, got.Revision)
+	}
+}
+
 // TestOrderedCreateContention pins the bounded retry budget. It is the only test
 // that constructs an *OrderedContentionError, and it proves the store gives up
 // with a typed, retryable error rather than spinning forever.
@@ -989,6 +1027,115 @@ func TestOrderedCreateContention(t *testing.T) {
 	if n := f.publishCount(); n != orderedCreateAttempts {
 		t.Fatalf("Create attempted %d batches, want %d", n, orderedCreateAttempts)
 	}
+}
+
+// TestOrderedCreateOrderExhausted pins the boundary of the order space. Order is
+// immutable and never reused, so a scope whose counter reached MaxUint64 is
+// permanently full and must fail loudly without writing anything.
+func TestOrderedCreateOrderExhausted(t *testing.T) {
+	t.Parallel()
+	f := newFakeOrderedSeam()
+	store := newOrderedStore(f)
+	id := orderedTestID()
+	counterSubj, _ := orderedSubjects(t, id)
+	f.mu.Lock()
+	f.setLocked(counterSubj, encodeOrderedCounter(math.MaxUint64))
+	f.mu.Unlock()
+
+	_, created, err := store.Create(context.Background(), id, "catalog", []byte("v"), storage.Rank{}, storage.Due{})
+	if created {
+		t.Fatal("created=true against an exhausted order space")
+	}
+	var exhausted *OrderedOrderExhaustedError
+	if !errors.As(err, &exhausted) {
+		t.Fatalf("error = %v (%T), want *OrderedOrderExhaustedError", err, err)
+	}
+	if exhausted.Order != math.MaxUint64 || exhausted.ID != id {
+		t.Fatalf("exhausted = %+v, want MaxUint64 for %+v", exhausted, id)
+	}
+	if msg := exhausted.Error(); !strings.Contains(msg, strconv.FormatUint(math.MaxUint64, 10)) {
+		t.Fatalf("Error() = %q, want the exhausted order", msg)
+	}
+	if n := f.publishCount(); n != 0 {
+		t.Fatalf("Create published %d times against an exhausted scope, want 0", n)
+	}
+}
+
+// TestOrderedSeamFailuresPropagate covers the I/O failure branches every method
+// inherits from the seam: provisioning and every record or counter read. None of
+// them may be mistaken for an absence.
+func TestOrderedSeamFailuresPropagate(t *testing.T) {
+	t.Parallel()
+	id := orderedTestID()
+	boom := errors.New("seam is down")
+
+	t.Run("ensure stream", func(t *testing.T) {
+		t.Parallel()
+		f := newFakeOrderedSeam()
+		f.ensureErr = boom
+		store := newOrderedStore(f)
+		_, created, err := store.Create(context.Background(), id, "catalog", nil, storage.Rank{}, storage.Due{})
+		if created || !errors.Is(err, boom) {
+			t.Fatalf("Create = (created=%v, %v), want the ensureStream failure", created, err)
+		}
+		if n := f.publishCount(); n != 0 {
+			t.Fatalf("Create published %d times without a stream, want 0", n)
+		}
+	})
+
+	t.Run("reads", func(t *testing.T) {
+		t.Parallel()
+		cases := []struct {
+			name string
+			call func(*orderedStore) error
+		}{
+			{name: "get", call: func(s *orderedStore) error {
+				_, err := s.Get(context.Background(), id)
+				return err
+			}},
+			{name: "create", call: func(s *orderedStore) error {
+				_, _, err := s.Create(context.Background(), id, "catalog", nil, storage.Rank{}, storage.Due{})
+				return err
+			}},
+			{name: "update", call: func(s *orderedStore) error {
+				_, err := s.Update(context.Background(), id, 1, nil, storage.Rank{}, storage.Due{})
+				return err
+			}},
+			{name: "delete", call: func(s *orderedStore) error {
+				_, err := s.Delete(context.Background(), id, 1)
+				return err
+			}},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				f := newFakeOrderedSeam()
+				f.getErr = boom
+				store := newOrderedStore(f)
+				if err := tc.call(store); !errors.Is(err, boom) {
+					t.Fatalf("error = %v, want the read failure %v", err, boom)
+				}
+				if n := f.publishCount(); n != 0 {
+					t.Fatalf("published %d times after a failed read, want 0", n)
+				}
+			})
+		}
+	})
+
+	t.Run("counter read after the identity read succeeds", func(t *testing.T) {
+		t.Parallel()
+		f := newFakeOrderedSeam()
+		store := newOrderedStore(f)
+		f.failGetAfter = 1
+		f.getErr = boom
+		_, _, err := store.Create(context.Background(), id, "catalog", nil, storage.Rank{}, storage.Due{})
+		if !errors.Is(err, boom) {
+			t.Fatalf("error = %v, want the counter read failure %v", err, boom)
+		}
+		if n := f.publishCount(); n != 0 {
+			t.Fatalf("Create published %d times after a failed counter read, want 0", n)
+		}
+	})
 }
 
 // TestOrderedWaitBeforeRetry pins the backoff's three obligations: it is
@@ -1090,36 +1237,5 @@ func TestOrderedScopeLatchIsReleased(t *testing.T) {
 	store.mu.Unlock()
 	if idle != 0 {
 		t.Fatalf("idle latches = %d, want the scope dropped", idle)
-	}
-}
-
-// TestOrderedCreateAmbiguityProvesOwnWrite pins the honest answer to a FIRST
-// Create whose acknowledgement was lost: the record read back is byte-identical
-// to the one this call tried to write, which proves the write landed, so
-// created=true. Reporting created=false there fails any conformance assertion
-// that exactly one of N concurrent creators sees created=true.
-func TestOrderedCreateAmbiguityProvesOwnWrite(t *testing.T) {
-	t.Parallel()
-	f := newFakeOrderedSeam()
-	store := newOrderedStore(f)
-	id := orderedTestID()
-	f.hook = func(f *fakeOrderedSeam, msgs []orderedMsg) error {
-		f.hook = nil
-		// The batch DID commit; only the acknowledgement was lost.
-		if err := f.applyLocked(msgs); err != nil {
-			return err
-		}
-		return errOrderedAmbiguous
-	}
-	got, created, err := store.Create(context.Background(), id, "catalog", []byte("v"),
-		storage.Rank{Ranked: true, Value: 3}, storage.Due{State: storage.DueAt, UnixMillis: 7})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	if !created {
-		t.Fatal("created=false although the record read back is the one this call wrote")
-	}
-	if got.Order != 1 || got.Revision != 1 {
-		t.Fatalf("Create returned order=%d revision=%d, want 1/1", got.Order, got.Revision)
 	}
 }

@@ -462,3 +462,101 @@ func TestOrderedStoreCreateContentionScales(t *testing.T) {
 		})
 	}
 }
+
+// TestOrderedBatchFenceAndRollbackOnServer covers, against the real server, the
+// two batch properties Create's correctness rests on and that the unit tests can
+// only assert against the fake: the record subject's expectLastSeq=0 fence
+// really rejects an existing identity, and a rejected batch really commits
+// NOTHING — in particular the counter member does not land. Create itself cannot
+// reach this path, because a duplicate identity short-circuits at the identity
+// read long before the batch, so without this test the behaviour is unexercised
+// against a server.
+func TestOrderedBatchFenceAndRollbackOnServer(t *testing.T) {
+	store, seam := newOrderedTestStore(t)
+	ctx := testCtx(t)
+	id := orderedIntegrationID("fenced")
+	spec, counterSubj, recordSubj, err := orderedLocation(id)
+	if err != nil {
+		t.Fatalf("orderedLocation: %v", err)
+	}
+	rec, _, err := store.Create(ctx, id, "catalog/main", []byte("first"), storage.Rank{}, storage.Due{})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	counterSeq, counterData, err := seam.lastMsgForSubject(ctx, spec.stream, counterSubj)
+	if err != nil {
+		t.Fatalf("lastMsgForSubject(counter): %v", err)
+	}
+	recordSeq, _, err := seam.lastMsgForSubject(ctx, spec.stream, recordSubj)
+	if err != nil {
+		t.Fatalf("lastMsgForSubject(record): %v", err)
+	}
+
+	// A well-formed allocation batch whose ONLY defect is that the identity is
+	// already taken: the counter member's fence is correct, the record member's
+	// "must not exist" fence is not.
+	payload, err := encodeOrderedRecord(storage.OrderedRecord{
+		ID: id, RankingScope: "catalog/main", Revision: 1, Order: rec.Order + 1, Value: []byte("second"),
+	})
+	if err != nil {
+		t.Fatalf("encodeOrderedRecord: %v", err)
+	}
+	err = seam.publishBatch(ctx, spec.stream, []orderedMsg{
+		{subject: counterSubj, data: encodeOrderedCounter(rec.Order + 1), expectLastSeq: counterSeq},
+		{subject: recordSubj, data: payload, expectLastSeq: 0},
+	})
+	if !errors.Is(err, errOrderedPrecondition) {
+		t.Fatalf("error = %v, want a fence loss; the record subject's expectLastSeq=0 did not fence", err)
+	}
+
+	// All or nothing: the counter member must not have committed either.
+	gotCounterSeq, gotCounterData, err := seam.lastMsgForSubject(ctx, spec.stream, counterSubj)
+	if err != nil {
+		t.Fatalf("lastMsgForSubject(counter) after rollback: %v", err)
+	}
+	if gotCounterSeq != counterSeq || !bytes.Equal(gotCounterData, counterData) {
+		t.Fatalf("the counter moved to seq %d %q after a rejected batch; want seq %d %q",
+			gotCounterSeq, gotCounterData, counterSeq, counterData)
+	}
+	gotRecordSeq, _, err := seam.lastMsgForSubject(ctx, spec.stream, recordSubj)
+	if err != nil {
+		t.Fatalf("lastMsgForSubject(record) after rollback: %v", err)
+	}
+	if gotRecordSeq != recordSeq {
+		t.Fatalf("the record moved to seq %d after a rejected batch, want %d", gotRecordSeq, recordSeq)
+	}
+	// The store still reads the original record.
+	got, err := store.Get(ctx, id)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Order != rec.Order || !bytes.Equal(got.Value, []byte("first")) {
+		t.Fatalf("Get returned %+v after a rejected batch, want the original", got)
+	}
+}
+
+// TestOrderedStoreAdoptsOnlyANonExpiringStream proves the provisioning check
+// refuses a stream that carries the right layout marker but a retention limit
+// that would delete records behind the store's back. Order is never reused, so
+// an expired identity subject reads absent and the next Create would reallocate
+// an order that has already been handed out.
+func TestOrderedStoreAdoptsOnlyANonExpiringStream(t *testing.T) {
+	store, seam := newOrderedTestStore(t)
+	ctx := testCtx(t)
+	id := orderedIntegrationID("k")
+	spec, _, _, err := orderedLocation(id)
+	if err != nil {
+		t.Fatalf("orderedLocation: %v", err)
+	}
+	cfg := orderedStreamConfig(spec)
+	cfg.MaxAge = time.Hour
+	if _, err := seam.js.CreateStream(ctx, cfg); err != nil {
+		t.Fatalf("CreateStream(expiring): %v", err)
+	}
+	_, _, err = store.Create(ctx, id, "catalog/main", nil, storage.Rank{}, storage.Due{})
+	var configErr *OrderedStreamConfigError
+	if !errors.As(err, &configErr) {
+		t.Fatalf("error = %v (%T), want *OrderedStreamConfigError", err, err)
+	}
+}
