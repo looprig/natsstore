@@ -1,0 +1,349 @@
+package natsstore
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strconv"
+	"sync"
+	"sync/atomic"
+
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+)
+
+// orderedMaxMsgSize is the per-message ceiling configured on every ordered
+// stream. It sits generously above the storage 1 MiB value floor (plus the JSON
+// envelope, base64 value expansion, and JetStream framing) so a floor-sized
+// value round-trips. As with the ledger, the embedded server's connection-level
+// MaxPayload is higher still, so THIS cap is the effective limit.
+const orderedMaxMsgSize int32 = 4 << 20
+
+// Compile-time guard: the ordered stream's per-message ceiling must never exceed
+// the embedded server's connection-level MaxPayload (embedded.go). Converting a
+// negative constant to an unsigned type is a compile error, so raising
+// orderedMaxMsgSize past maxPayload fails the build here rather than surfacing as
+// a confusing ErrMaxPayload at the connection at runtime.
+const _ = uint(maxPayload - orderedMaxMsgSize)
+
+// The atomic-batch wire headers. nats.go v1.53.1 exposes AllowAtomicPublish on
+// jetstream.StreamConfig but ships no client-side batch publisher, and its PubAck
+// carries neither the batch id nor the batch size, so the protocol is spoken here
+// with raw headers and a hand-decoded commit acknowledgement. This file is the
+// only place that does so.
+const (
+	orderedHdrBatchID     = "Nats-Batch-Id"
+	orderedHdrBatchSeq    = "Nats-Batch-Sequence"
+	orderedHdrBatchCommit = "Nats-Batch-Commit"
+)
+
+// OrderedStreamOpError reports a definite failure of a stream-management
+// operation the ordered seam performs (lookup, create, info, or a batch member
+// publish). It names the stream and the operation and unwraps to the underlying
+// NATS error.
+type OrderedStreamOpError struct {
+	Stream string
+	Op     string
+	Cause  error
+}
+
+func (e *OrderedStreamOpError) Error() string {
+	return "natsstore: ordered stream " + strconv.Quote(e.Stream) + " " + e.Op + " failed: " + e.Cause.Error()
+}
+
+// Unwrap returns the underlying cause.
+func (e *OrderedStreamOpError) Unwrap() error { return e.Cause }
+
+// OrderedStreamConfigError reports a stream that already exists under an ordered
+// namespace's name but was not provisioned by this layout — a different schema
+// version, or a configuration this design's atomicity depends on. The seam
+// refuses to write into it rather than silently adopting it.
+type OrderedStreamConfigError struct {
+	Stream string
+	Reason string
+}
+
+func (e *OrderedStreamConfigError) Error() string {
+	return "natsstore: ordered stream " + strconv.Quote(e.Stream) + " is not usable: " + e.Reason
+}
+
+// OrderedBatchRejectedError reports an atomic batch the server rejected for a
+// reason other than a failed sequence fence. No message in the batch committed.
+type OrderedBatchRejectedError struct {
+	BatchID     string
+	Code        int
+	ErrCode     uint16
+	Description string
+}
+
+func (e *OrderedBatchRejectedError) Error() string {
+	return "natsstore: ordered batch " + strconv.Quote(e.BatchID) + " rejected: code=" +
+		strconv.Itoa(e.Code) + " err_code=" + strconv.FormatUint(uint64(e.ErrCode), 10) +
+		" " + strconv.Quote(e.Description)
+}
+
+// orderedAPIError mirrors the server's ApiError as it appears inside a publish
+// acknowledgement. It is the narrow serialization boundary this package's typing
+// rules allow.
+type orderedAPIError struct {
+	Code        int    `json:"code"`
+	ErrCode     uint16 `json:"err_code"`
+	Description string `json:"description"`
+}
+
+// orderedBatchAck mirrors the server's PubAck response to a batch commit.
+type orderedBatchAck struct {
+	Stream    string           `json:"stream"`
+	Sequence  uint64           `json:"seq"`
+	BatchID   string           `json:"batch"`
+	BatchSize uint64           `json:"count"`
+	Error     *orderedAPIError `json:"error"`
+}
+
+// jetStreamOrderedSeam is the production orderedSeam: it binds the ordered
+// store's four operations to a real jetstream.JetStream plus the raw connection
+// the batch protocol needs. It caches the stream handle for each provisioned
+// namespace, so the lazy provisioning check costs one round trip per namespace
+// per process rather than one per mutation.
+type jetStreamOrderedSeam struct {
+	nc *nats.Conn
+	js jetstream.JetStream
+
+	batchID atomic.Uint64
+
+	mu      sync.RWMutex
+	streams map[string]jetstream.Stream
+}
+
+var _ orderedSeam = (*jetStreamOrderedSeam)(nil)
+
+// newJetStreamOrderedSeam wraps a connection and its jetstream context as a
+// production ordered seam. The new jetstream package is required, not optional:
+// the legacy nats.JetStreamContext cannot create an AllowAtomicPublish stream.
+func newJetStreamOrderedSeam(nc *nats.Conn, js jetstream.JetStream) *jetStreamOrderedSeam {
+	return &jetStreamOrderedSeam{nc: nc, js: js, streams: map[string]jetstream.Stream{}}
+}
+
+// orderedStreamConfig is the configuration every ordered namespace stream must
+// carry. MaxMsgsPerSubject=1 is load-bearing twice over: it keeps exactly the
+// current counter and record versions, and it makes "the last message on the
+// subject" the value a compare-and-swap fences on.
+func orderedStreamConfig(spec orderedStreamSpec) jetstream.StreamConfig {
+	return jetstream.StreamConfig{
+		Name:               spec.stream,
+		Description:        orderedStreamDescription,
+		Subjects:           []string{spec.subjectFilter},
+		Retention:          jetstream.LimitsPolicy,
+		Discard:            jetstream.DiscardOld,
+		Storage:            jetstream.FileStorage,
+		MaxMsgs:            -1,
+		MaxBytes:           -1,
+		MaxAge:             0,
+		MaxMsgsPerSubject:  1,
+		MaxMsgSize:         orderedMaxMsgSize,
+		Replicas:           1,
+		AllowAtomicPublish: true,
+	}
+}
+
+// ensureStream lazily provisions the namespace's stream and verifies its layout.
+// A stream created by an older or foreign layout is refused with a typed error
+// instead of being written into; a stream this process has already verified is
+// served from the handle cache.
+func (s *jetStreamOrderedSeam) ensureStream(ctx context.Context, spec orderedStreamSpec) error {
+	if _, ok := s.cachedStream(spec.stream); ok {
+		return nil
+	}
+	stream, err := s.js.Stream(ctx, spec.stream)
+	if errors.Is(err, jetstream.ErrStreamNotFound) {
+		stream, err = s.js.CreateStream(ctx, orderedStreamConfig(spec))
+		if errors.Is(err, jetstream.ErrStreamNameAlreadyInUse) {
+			// A concurrent creator won; adopt and verify whatever is there.
+			stream, err = s.js.Stream(ctx, spec.stream)
+		}
+	}
+	if err != nil {
+		return &OrderedStreamOpError{Stream: spec.stream, Op: "ensure", Cause: err}
+	}
+	info, err := stream.Info(ctx)
+	if err != nil {
+		return &OrderedStreamOpError{Stream: spec.stream, Op: "info", Cause: err}
+	}
+	if err := verifyOrderedStreamConfig(spec, info.Config); err != nil {
+		return err
+	}
+	s.cacheStream(spec.stream, stream)
+	return nil
+}
+
+// verifyOrderedStreamConfig checks the properties the ordered design depends on.
+// Anything else about the stream is the operator's business.
+func verifyOrderedStreamConfig(spec orderedStreamSpec, cfg jetstream.StreamConfig) error {
+	if cfg.Description != orderedStreamDescription {
+		return &OrderedStreamConfigError{
+			Stream: spec.stream,
+			Reason: "layout is " + strconv.Quote(cfg.Description) + ", want " + strconv.Quote(orderedStreamDescription),
+		}
+	}
+	if !cfg.AllowAtomicPublish {
+		return &OrderedStreamConfigError{Stream: spec.stream, Reason: "atomic publish is disabled"}
+	}
+	if cfg.MaxMsgsPerSubject != 1 {
+		return &OrderedStreamConfigError{
+			Stream: spec.stream,
+			Reason: "max messages per subject is " + strconv.FormatInt(cfg.MaxMsgsPerSubject, 10) + ", want 1",
+		}
+	}
+	if len(cfg.Subjects) != 1 || cfg.Subjects[0] != spec.subjectFilter {
+		return &OrderedStreamConfigError{
+			Stream: spec.stream,
+			Reason: "subjects are not exactly " + strconv.Quote(spec.subjectFilter),
+		}
+	}
+	return nil
+}
+
+func (s *jetStreamOrderedSeam) cachedStream(name string) (jetstream.Stream, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	stream, ok := s.streams[name]
+	return stream, ok
+}
+
+func (s *jetStreamOrderedSeam) cacheStream(name string, stream jetstream.Stream) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.streams[name] = stream
+}
+
+// lastMsgForSubject returns the current message on subject. An absent stream and
+// an absent subject are both reported as sequence 0 with no error, which is
+// exactly the value the expected-last-subject-sequence fence uses to mean "must
+// not exist", so a read and the following write agree by construction.
+func (s *jetStreamOrderedSeam) lastMsgForSubject(ctx context.Context, streamName, subject string) (uint64, []byte, error) {
+	stream, ok := s.cachedStream(streamName)
+	if !ok {
+		var err error
+		stream, err = s.js.Stream(ctx, streamName)
+		if errors.Is(err, jetstream.ErrStreamNotFound) {
+			return 0, nil, nil
+		}
+		if err != nil {
+			return 0, nil, &OrderedStreamOpError{Stream: streamName, Op: "lookup", Cause: err}
+		}
+	}
+	msg, err := stream.GetLastMsgForSubject(ctx, subject)
+	if errors.Is(err, jetstream.ErrMsgNotFound) {
+		return 0, nil, nil
+	}
+	if err != nil {
+		return 0, nil, &OrderedStreamOpError{Stream: streamName, Op: "get last message", Cause: err}
+	}
+	return msg.Sequence, msg.Data, nil
+}
+
+// publish commits one fenced message, translating the server's rejection onto
+// errOrderedPrecondition and a lost acknowledgement onto errOrderedAmbiguous.
+func (s *jetStreamOrderedSeam) publish(ctx context.Context, msg orderedMsg) error {
+	m := nats.NewMsg(msg.subject)
+	m.Data = msg.data
+	if _, err := s.js.PublishMsg(ctx, m, jetstream.WithExpectLastSequencePerSubject(msg.expectLastSeq)); err != nil {
+		if isOrderedWrongLastSeq(err) {
+			return errOrderedPrecondition
+		}
+		if isOrderedAmbiguous(err) {
+			return errors.Join(errOrderedAmbiguous, err)
+		}
+		return err
+	}
+	return nil
+}
+
+// publishBatch commits msgs as one atomic batch. Every member but the last is a
+// fire-and-forget publish carrying the batch id and its sequence within the
+// batch; the last also carries the commit header and is a request whose reply is
+// the batch's single acknowledgement. Each member keeps its OWN
+// expected-last-subject-sequence, which is why the counter and the record can be
+// fenced independently — and why no batch may ever name one subject twice.
+func (s *jetStreamOrderedSeam) publishBatch(ctx context.Context, msgs []orderedMsg) error {
+	if len(msgs) == 0 {
+		return &OrderedBatchRejectedError{Description: "batch has no messages"}
+	}
+	id := "natsstore-" + strconv.FormatUint(s.batchID.Add(1), 10)
+	for i, m := range msgs {
+		msg := nats.NewMsg(m.subject)
+		msg.Data = m.data
+		msg.Header.Set(orderedHdrBatchID, id)
+		msg.Header.Set(orderedHdrBatchSeq, strconv.Itoa(i+1))
+		msg.Header.Set(jetstream.ExpectedLastSubjSeqHeader, strconv.FormatUint(m.expectLastSeq, 10))
+		if i < len(msgs)-1 {
+			// One connection, so these reach the server in order, ahead of the commit.
+			// A local publish failure means the commit below never happens, so the
+			// batch cannot have committed: it is definite, not ambiguous.
+			if err := s.nc.PublishMsg(msg); err != nil {
+				return &OrderedStreamOpError{Op: "batch member publish", Cause: err}
+			}
+			continue
+		}
+		msg.Header.Set(orderedHdrBatchCommit, "1")
+		reply, err := s.nc.RequestMsgWithContext(ctx, msg)
+		if err != nil {
+			if isOrderedAmbiguous(err) {
+				return errors.Join(errOrderedAmbiguous, err)
+			}
+			return &OrderedStreamOpError{Op: "batch commit", Cause: err}
+		}
+		var ack orderedBatchAck
+		if err := json.Unmarshal(reply.Data, &ack); err != nil {
+			return &OrderedStreamOpError{Op: "batch commit ack decode", Cause: err}
+		}
+		if ack.Error != nil {
+			if isOrderedWrongLastSeqCode(ack.Error.ErrCode) {
+				return errOrderedPrecondition
+			}
+			return &OrderedBatchRejectedError{
+				BatchID:     id,
+				Code:        ack.Error.Code,
+				ErrCode:     ack.Error.ErrCode,
+				Description: ack.Error.Description,
+			}
+		}
+		if ack.BatchSize != uint64(len(msgs)) {
+			return &OrderedBatchRejectedError{
+				BatchID:     id,
+				Description: "server committed " + strconv.FormatUint(ack.BatchSize, 10) + " of " + strconv.Itoa(len(msgs)) + " messages",
+			}
+		}
+	}
+	return nil
+}
+
+// isOrderedWrongLastSeqCode reports whether an ApiError code is the server's
+// expected-last-sequence rejection. Both spellings are matched: R1 returns
+// JSStreamWrongLastSequence and a replicated stream returns the "Constant"
+// variant, and the design must classify a CAS loss identically under either.
+func isOrderedWrongLastSeqCode(code uint16) bool {
+	return jetstream.ErrorCode(code) == jetstream.JSErrCodeStreamWrongLastSequence ||
+		jetstream.ErrorCode(code) == jetstream.JSErrCodeStreamWrongLastSequenceConstant
+}
+
+// isOrderedWrongLastSeq reports whether err is that rejection delivered as a
+// typed client error.
+func isOrderedWrongLastSeq(err error) bool {
+	var apiErr *jetstream.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	return apiErr.ErrorCode == jetstream.JSErrCodeStreamWrongLastSequence ||
+		apiErr.ErrorCode == jetstream.JSErrCodeStreamWrongLastSequenceConstant
+}
+
+// isOrderedAmbiguous reports whether err leaves the outcome of a write unknown:
+// the request was sent but no acknowledgement came back.
+func isOrderedAmbiguous(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, nats.ErrTimeout) ||
+		errors.Is(err, nats.ErrNoResponders) ||
+		errors.Is(err, nats.ErrNoStreamResponse) ||
+		errors.Is(err, jetstream.ErrNoStreamResponse)
+}
