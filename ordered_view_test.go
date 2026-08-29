@@ -1017,6 +1017,43 @@ func TestOrderedViewCancelledEvictionRemainsForClose(t *testing.T) {
 	}
 }
 
+// TestOrderedViewNextQueryRebootsAfterCancelledEviction proves a query whose
+// context expired while retiring a config-fatal view does not impose one extra
+// fatal response after the view finishes and the operator repairs the stream.
+func TestOrderedViewNextQueryRebootsAfterCancelledEviction(t *testing.T) {
+	t.Parallel()
+	store, f := newViewTestStore(t)
+	ctx := viewCtx(t)
+	record := liveOrderedRecord(viewID("tenant/a", "repaired"), 1, 1)
+	record.Due = dueAt(1)
+	seedOrderedRecord(t, f, record)
+
+	done := make(chan struct{})
+	fatal := &OrderedStreamConfigError{Stream: "OI_sessions", Reason: "max age is nonzero"}
+	retained := &orderedView{
+		namespace: viewTestNamespace,
+		cancel:    func() {},
+		done:      done,
+		fatal:     fatal,
+	}
+	store.views[viewTestNamespace] = retained
+	evictCtx, cancelEvict := context.WithCancel(context.Background())
+	cancelEvict()
+	store.evictRepairableFatal(evictCtx, viewTestNamespace, retained, fatal)
+	close(done) // the cancelled view has now exited and the stream is repaired
+
+	page, err := store.ListDue(ctx, viewTestNamespace, 100, "", 10)
+	if err != nil {
+		t.Fatalf("first ListDue after repair: %v", err)
+	}
+	if got, want := viewLabels(page.Records), []string{"tenant/a/repaired"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("first ListDue after repair = %v, want %v", got, want)
+	}
+	if starts := f.watchStartCount(); starts != 1 {
+		t.Errorf("watchStream started %d replacements, want exactly 1", starts)
+	}
+}
+
 // TestOrderedViewStaleFatalCannotEvictReplacement proves eviction is bound to
 // the view that observed the fatal error. The stale eviction blocks on the
 // store mutex while a replacement is installed, reproducing the race directly.

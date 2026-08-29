@@ -774,10 +774,12 @@ type orderedView struct {
 	mu        sync.Mutex
 	changed   chan struct{}
 	watermark uint64
-	// fatal is a sticky, permanent failure of this view: a stream that cannot
-	// serve this layout, or a record payload that cannot be decoded. Both make
-	// every subsequent page a lie by omission, so waiters are failed rather than
-	// served.
+	// fatal is sticky for this view instance: a stream that currently cannot
+	// serve this layout, or a record payload that cannot be decoded. Both make a
+	// page from this view a lie by omission, so waiters fail. A stopped
+	// config-fatal view may be replaced after operator repair; corrupt payloads
+	// remain sticky because rebuilding would deterministically decode the same
+	// authoritative bytes.
 	fatal error
 
 	// records is the current version of every identity in the namespace,
@@ -833,8 +835,9 @@ func (v *orderedView) stop(ctx context.Context) error {
 
 // run keeps a subscription attached for the life of the view. A failed attach is
 // retried with the same jittered backoff the create path uses; a stream that
-// cannot serve this layout is fatal and ends the goroutine, because retrying it
-// would only park every reader on a barrier that can never be reached.
+// cannot serve this layout is fatal for this view and ends its goroutine. After
+// an operator repair, a later query may replace the stopped view rather than
+// retrying forever inside this goroutine.
 //
 // Re-attaching restarts from DeliverLastPerSubject, which is a COMPLETE refresh
 // of the namespace's current state, so a gap in the subscription cannot leave
@@ -940,9 +943,16 @@ func (v *orderedView) setFatal(err error) {
 		v.broadcastLocked()
 	}
 	v.mu.Unlock()
-	// The view can no longer answer, so it must not keep a server-side consumer
-	// alive either. Cancelling here is safe outside the lock and idempotent.
+	// This view instance can no longer answer, so it must not keep a server-side
+	// consumer alive either. Cancelling here is safe outside the lock and
+	// idempotent; a repairable replacement starts only after done closes.
 	v.cancel()
+}
+
+func (v *orderedView) fatalError() error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.fatal
 }
 
 // broadcastLocked wakes every barrier waiter by closing the current generation
@@ -1211,30 +1221,43 @@ func (s *orderedStore) view(namespace string) (*orderedView, error) {
 // guarantee meaningful: a tip captured afterwards would only prove the view was
 // caught up with some earlier moment.
 func (s *orderedStore) readyView(ctx context.Context, namespace string) (*orderedView, error) {
-	view, err := s.view(namespace)
-	if err != nil {
-		return nil, err
+	const maxRetiredViewRestarts = 1
+	for restarts := 0; ; {
+		view, err := s.view(namespace)
+		if err != nil {
+			return nil, err
+		}
+		// A fatal already present when this query acquires the view belongs to a
+		// previous query. Retire a repairable stopped view and bootstrap once in
+		// this same call, so operator repair takes effect on the next query.
+		if fatal := view.fatalError(); fatal != nil {
+			if restarts < maxRetiredViewRestarts && s.evictRepairableFatal(ctx, namespace, view, fatal) {
+				restarts++
+				continue
+			}
+			return nil, fatal
+		}
+		s.stats.streamTipReads.Add(1)
+		tip, err := s.seam.streamTip(ctx, view.spec.stream)
+		if err != nil {
+			return nil, err
+		}
+		if err := view.waitBarrier(ctx, tip); err != nil {
+			s.evictRepairableFatal(ctx, namespace, view, err)
+			return nil, err
+		}
+		return view, nil
 	}
-	s.stats.streamTipReads.Add(1)
-	tip, err := s.seam.streamTip(ctx, view.spec.stream)
-	if err != nil {
-		return nil, err
-	}
-	if err := view.waitBarrier(ctx, tip); err != nil {
-		s.evictRepairableFatal(ctx, namespace, view, err)
-		return nil, err
-	}
-	return view, nil
 }
 
 // evictRepairableFatal drops only a view whose stream configuration can be
 // repaired out of band. Corrupt record bytes remain sticky: rebuilding from
 // the same authoritative payload would deterministically fail again and should
 // not create an unbounded subscription loop.
-func (s *orderedStore) evictRepairableFatal(ctx context.Context, namespace string, view *orderedView, err error) {
+func (s *orderedStore) evictRepairableFatal(ctx context.Context, namespace string, view *orderedView, err error) bool {
 	var configErr *OrderedStreamConfigError
 	if !errors.As(err, &configErr) {
-		return
+		return false
 	}
 	// setFatal cancels the view before waking barrier waiters. Do not remove its
 	// last lifecycle handle until run has completed: otherwise a replacement can
@@ -1244,13 +1267,16 @@ func (s *orderedStore) evictRepairableFatal(ctx context.Context, namespace strin
 	select {
 	case <-view.done:
 	case <-ctx.Done():
-		return
+		return false
 	}
 	s.mu.Lock()
+	evicted := false
 	if s.views[namespace] == view {
 		delete(s.views, namespace)
+		evicted = true
 	}
 	s.mu.Unlock()
+	return evicted
 }
 
 // queryStats reports the query-work counters. It exists for this module's own
