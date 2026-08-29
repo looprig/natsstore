@@ -51,6 +51,17 @@ type fakeOrderedSeam struct {
 	getErr       error
 	failGetAfter int
 	gets         int
+
+	// The view seam's model. watchers are the live watchStream calls, hold (when
+	// non-nil) freezes delivery so a test can pin a view's watermark, watchErrs
+	// is a queue of attach failures, and the counters record the work a read
+	// path drove through the seam.
+	watchers    []*fakeWatcher
+	hold        chan struct{}
+	watchErrs   []error
+	tipErr      error
+	watchStarts int
+	tipReads    int
 }
 
 func newFakeOrderedSeam() *fakeOrderedSeam {
@@ -109,8 +120,21 @@ func (f *fakeOrderedSeam) applyLocked(msgs []orderedMsg) error {
 	for _, m := range msgs {
 		f.nextSeq++
 		f.msgs[m.subject] = fakeStoredMsg{seq: f.nextSeq, data: bytes.Clone(m.data)}
+		f.fanOutLocked(m.subject, f.nextSeq, m.data)
 	}
 	return nil
+}
+
+// fanOutLocked hands a committed message to every live watcher, which is the
+// model's stand-in for the server pushing the tail of the stream. The caller
+// must hold f.mu.
+func (f *fakeOrderedSeam) fanOutLocked(subject string, seq uint64, data []byte) {
+	for _, w := range f.watchers {
+		select {
+		case w.ch <- fakeDelivery{subject: subject, seq: seq, data: bytes.Clone(data)}:
+		default:
+		}
+	}
 }
 
 // setLocked writes subject unconditionally, simulating a concurrent writer. The
@@ -118,6 +142,7 @@ func (f *fakeOrderedSeam) applyLocked(msgs []orderedMsg) error {
 func (f *fakeOrderedSeam) setLocked(subject string, data []byte) {
 	f.nextSeq++
 	f.msgs[subject] = fakeStoredMsg{seq: f.nextSeq, data: bytes.Clone(data)}
+	f.fanOutLocked(subject, f.nextSeq, data)
 }
 
 func (f *fakeOrderedSeam) seqOf(subject string) uint64 {
@@ -1238,4 +1263,137 @@ func TestOrderedScopeLatchIsReleased(t *testing.T) {
 	if idle != 0 {
 		t.Fatalf("idle latches = %d, want the scope dropped", idle)
 	}
+}
+
+// --- view support ---------------------------------------------------------
+//
+// Everything below models the two seam operations the materialized view needs:
+// the stream's current tip sequence, and a subscription that replays the live
+// head of every subject and then tails the stream. The model deliberately keeps
+// only ONE message per subject (MaxMsgsPerSubject=1), so "replay the heads" is
+// the whole of the stream's state and no test can accidentally depend on a
+// historical walk that the real server cannot serve.
+
+// fakeDelivery is one message handed to a watcher.
+type fakeDelivery struct {
+	subject string
+	seq     uint64
+	data    []byte
+}
+
+// fakeWatcher is one live watchStream call.
+type fakeWatcher struct {
+	ch chan fakeDelivery
+}
+
+// watchStream replays the current heads in stream-sequence order and then tails
+// every later commit until ctx ends. The watcher is registered BEFORE the
+// snapshot is taken, so a message committed in between is delivered twice —
+// which is exactly what a real re-attach can do, and the view must be
+// idempotent under it.
+func (f *fakeOrderedSeam) watchStream(ctx context.Context, spec orderedStreamSpec, apply func(subject string, seq uint64, data []byte)) error {
+	f.mu.Lock()
+	f.watchStarts++
+	if len(f.watchErrs) > 0 {
+		err := f.watchErrs[0]
+		f.watchErrs = f.watchErrs[1:]
+		f.mu.Unlock()
+		return err
+	}
+	w := &fakeWatcher{ch: make(chan fakeDelivery, 4096)}
+	f.watchers = append(f.watchers, w)
+	snapshot := make([]fakeDelivery, 0, len(f.msgs))
+	for subject, msg := range f.msgs {
+		snapshot = append(snapshot, fakeDelivery{subject: subject, seq: msg.seq, data: bytes.Clone(msg.data)})
+	}
+	f.mu.Unlock()
+	defer f.removeWatcher(w)
+
+	slices.SortFunc(snapshot, func(a, b fakeDelivery) int { return int(a.seq) - int(b.seq) })
+	for _, d := range snapshot {
+		if err := f.awaitDelivery(ctx); err != nil {
+			return nil
+		}
+		apply(d.subject, d.seq, d.data)
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case d := <-w.ch:
+			if err := f.awaitDelivery(ctx); err != nil {
+				return nil
+			}
+			apply(d.subject, d.seq, d.data)
+		}
+	}
+}
+
+// awaitDelivery blocks while the test is holding deliveries back. It is how a
+// test freezes a view at a known watermark and proves a query waits.
+func (f *fakeOrderedSeam) awaitDelivery(ctx context.Context) error {
+	f.mu.Lock()
+	hold := f.hold
+	f.mu.Unlock()
+	if hold == nil {
+		return ctx.Err()
+	}
+	select {
+	case <-hold:
+		return ctx.Err()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// holdDeliveries stops the fake from handing any further message to a watcher
+// until the returned release function runs.
+func (f *fakeOrderedSeam) holdDeliveries() func() {
+	hold := make(chan struct{})
+	f.mu.Lock()
+	f.hold = hold
+	f.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			f.mu.Lock()
+			f.hold = nil
+			f.mu.Unlock()
+			close(hold)
+		})
+	}
+}
+
+func (f *fakeOrderedSeam) removeWatcher(w *fakeWatcher) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.watchers = slices.DeleteFunc(f.watchers, func(candidate *fakeWatcher) bool { return candidate == w })
+}
+
+func (f *fakeOrderedSeam) streamTip(_ context.Context, _ string) (uint64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.tipReads++
+	if f.tipErr != nil {
+		return 0, f.tipErr
+	}
+	return f.nextSeq, nil
+}
+
+func (f *fakeOrderedSeam) watcherCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.watchers)
+}
+
+func (f *fakeOrderedSeam) watchStartCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.watchStarts
+}
+
+func (f *fakeOrderedSeam) getCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.gets
 }

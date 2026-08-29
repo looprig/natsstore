@@ -7,8 +7,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"math"
+	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/looprig/storage"
@@ -32,6 +34,13 @@ const orderedCreateAttempts = 64
 const (
 	orderedRetryBase     = 100 * time.Microsecond
 	orderedRetryMaxShift = 8 // cap the window at orderedRetryBase << 8
+
+	// orderedViewRetryBase is the window a namespace view starts from when its
+	// subscription must be re-attached. It is far larger than the create-path
+	// base because a detached view is waiting on a stream or a connection, not
+	// racing another writer, and a tight re-attach loop would only add load to a
+	// server that is already unwell.
+	orderedViewRetryBase = 50 * time.Millisecond
 )
 
 // The seam reports exactly two conditions the ordered store must distinguish
@@ -116,6 +125,13 @@ type orderedSeam interface {
 	// same two sentinels. A rejected batch commits nothing. stream names the
 	// stream the subjects live in, so a failure can say which one it was.
 	publishBatch(ctx context.Context, stream string, msgs []orderedMsg) error
+	// streamTip returns the stream's last stored sequence, or 0 when the stream
+	// does not exist. It is the barrier a query captures before reading.
+	streamTip(ctx context.Context, stream string) (uint64, error)
+	// watchStream delivers the current head of every subject in the stream and
+	// then every later commit, to apply, until ctx ends. It returns nil when ctx
+	// ended and an error when the subscription failed and must be re-attached.
+	watchStream(ctx context.Context, spec orderedStreamSpec, apply func(subject string, seq uint64, data []byte)) error
 }
 
 // orderedStore implements the mutating half of storage.OrderedIndex over one
@@ -135,9 +151,20 @@ type orderedStore struct {
 	// without paying for the waits; production always uses orderedRetryBase.
 	retryBase time.Duration
 
-	// mu guards latches, the per-order-scope in-process queue. See acquireScope.
+	// viewRetryBase is the backoff window the materialized view starts from when
+	// its subscription must be re-attached. It is a field for the same reason
+	// retryBase is: tests drive a re-attach without paying for the waits.
+	viewRetryBase time.Duration
+
+	// mu guards latches (the per-order-scope in-process queue; see acquireScope),
+	// the per-namespace view registry, and the closed flag.
 	mu      sync.Mutex
 	latches map[string]*orderedScopeLatch
+	views   map[string]*orderedView
+	closed  bool
+
+	// stats counts the work the query paths perform. See orderedStats.
+	stats *orderedStats
 
 	// localPathReporter carries the engine's on-disk paths. It is populated when
 	// the store is wired into the composite (see buildComposite in natsstore.go),
@@ -148,9 +175,12 @@ type orderedStore struct {
 // newOrderedStore builds an ordered index over seam.
 func newOrderedStore(seam orderedSeam) *orderedStore {
 	return &orderedStore{
-		seam:      seam,
-		retryBase: orderedRetryBase,
-		latches:   map[string]*orderedScopeLatch{},
+		seam:          seam,
+		retryBase:     orderedRetryBase,
+		viewRetryBase: orderedViewRetryBase,
+		latches:       map[string]*orderedScopeLatch{},
+		views:         map[string]*orderedView{},
+		stats:         &orderedStats{},
 	}
 }
 
@@ -207,16 +237,27 @@ func (s *orderedStore) acquireScope(ctx context.Context, key string) (func(), er
 // window ("full jitter"), or returns ctx's error if the caller gives up first.
 // The randomness is what breaks the herd, so it is drawn per caller per attempt.
 func (s *orderedStore) waitBeforeRetry(ctx context.Context, attempt int) error {
-	if s.retryBase <= 0 {
+	return orderedBackoff(ctx, s.retryBase, attempt-1, orderedRetryMaxShift)
+}
+
+// orderedBackoff sleeps a uniformly random slice of an exponentially growing
+// window ("full jitter"), or returns ctx's error if the caller gives up first.
+// The randomness is what breaks a herd, so it is drawn per caller per attempt.
+//
+// A zero or negative base disables the wait entirely — there is nothing to wait
+// for, so not even a cancelled context turns the call into a failure — which is
+// how tests drive a retry budget to exhaustion without paying for it. shift is
+// the number of doublings requested and is clamped into [0, maxShift].
+func orderedBackoff(ctx context.Context, base time.Duration, shift int, maxShift int) error {
+	if base <= 0 {
 		return nil
 	}
-	shift := min(attempt-1, orderedRetryMaxShift)
-	window := s.retryBase << shift
+	shift = min(max(shift, 0), maxShift)
+	window := base << shift
 	var b [8]byte
 	orderedRandomBytes(b[:])
-	// #nosec G115 -- window is retryBase (a positive constant) shifted by at most
-	// orderedRetryMaxShift, so it is a small positive Duration; the modulus keeps
-	// the result inside it.
+	// #nosec G115 -- window is a positive base shifted by at most maxShift, so it
+	// is a small positive Duration; the modulus keeps the result inside it.
 	delay := time.Duration(binary.BigEndian.Uint64(b[:]) % uint64(window))
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
@@ -555,4 +596,858 @@ func orderedRecordEqual(a, b storage.OrderedRecord) bool {
 		a.Rank == b.Rank &&
 		a.Deleted == b.Deleted &&
 		bytes.Equal(a.Value, b.Value)
+}
+
+// --- materialized query views ----------------------------------------------
+//
+// A namespace's authoritative state lives in JetStream: one message per record
+// subject, one per order-scope counter subject, MaxMsgsPerSubject=1. That layout
+// is exactly right for the mutating half of OrderedIndex — the last message on a
+// subject IS the current version, and its stream sequence is the fence a
+// compare-and-swap writes under — and it offers nothing at all to a query. There
+// is no server-side secondary index on rank or due time, and no subject-listing
+// call whose cost is proportional to a page.
+//
+// So the provider maintains one. The view below is an INTERNAL PROVIDER INDEX
+// derived from the authoritative stream, not a second SessionStore and not a
+// cache with its own retention policy: it holds no state that JetStream does not
+// hold, it is rebuilt from live heads whenever the process or the subscription
+// restarts, and losing it costs a re-bootstrap and nothing else. Nothing is ever
+// read from it that was not written to JetStream first.
+//
+// Three properties are load-bearing:
+//
+//  1. It is built from LIVE HEADS. The subscription is DeliverLastPerSubject
+//     plus the tail, never a historical replay — because with
+//     MaxMsgsPerSubject=1 there is no history to replay, and because
+//     Invariant 15 forbids a read path that enumerates subjects or walks the
+//     past.
+//  2. A query is CAUGHT UP before it answers. It captures the stream's tip
+//     sequence, waits for the view to have applied through at least that tip,
+//     and only then pages an index. A reader therefore never observes a state
+//     older than the moment its own call began.
+//  3. Its indexes are SORTED, so a page costs its own limit plus the binary
+//     searches that locate it, independent of how many records the namespace
+//     holds.
+
+// orderedViewRetryMaxShift caps the view's re-attach backoff window. It is
+// shorter than the create path's cap because a detached view is not competing
+// with anything: it is waiting for a stream or a connection to come back, and a
+// reader is parked on the barrier while it does.
+const orderedViewRetryMaxShift = 6
+
+// orderedIdentity is the comparable in-view key for a record. The namespace is
+// fixed by the view, so the remaining identity components are the ordering scope
+// and the stable key. It is deliberately NOT the hashed subject token: the view
+// indexes identities, and the authoritative identity is the one the payload
+// carries and decodeOrderedRecord has already verified against the subject.
+type orderedIdentity struct {
+	orderingScope string
+	stableKey     storage.StableKey
+}
+
+// orderedComparator is a strict ordering over two records under one of the two
+// frozen sort keys. Each key is defined by EXACTLY ONE function, and both the
+// index-maintenance path and the cursor-resume path consult that same function —
+// the resume path by searching for a probe record built from the cursor. Stating
+// an ordering twice is how a tiebreaker silently disappears from one copy.
+type orderedComparator func(left, right storage.OrderedRecord) bool
+
+// orderedRankedBefore is the frozen DESCENDING ranked order:
+// (rank, stable_key, ordering_scope), each compared larger-first. Namespace and
+// ranking scope are fixed by the index this comparator sorts.
+//
+// The third component is required, not decorative. Record identity is
+// (namespace, ordering_scope, stable_key), so two records in one ranking scope
+// may share a rank AND a stable key while remaining distinct records; without
+// the ordering-scope tiebreaker they would be indistinguishable to a cursor and
+// pagination would either skip one forever or loop on it.
+func orderedRankedBefore(left, right storage.OrderedRecord) bool {
+	if left.Rank.Value != right.Rank.Value {
+		return left.Rank.Value > right.Rank.Value
+	}
+	if left.ID.StableKey != right.ID.StableKey {
+		return left.ID.StableKey > right.ID.StableKey
+	}
+	return left.ID.OrderingScope > right.ID.OrderingScope
+}
+
+// orderedDueBefore is the frozen ASCENDING due order:
+// (due_at, stable_key, ordering_scope), each compared smaller-first. The
+// ordering-scope tiebreaker is required for the same reason as in
+// orderedRankedBefore.
+func orderedDueBefore(left, right storage.OrderedRecord) bool {
+	if left.Due.UnixMillis != right.Due.UnixMillis {
+		return left.Due.UnixMillis < right.Due.UnixMillis
+	}
+	if left.ID.StableKey != right.ID.StableKey {
+		return left.ID.StableKey < right.ID.StableKey
+	}
+	return left.ID.OrderingScope < right.ID.OrderingScope
+}
+
+// orderedStats counts the work the ordered store's query paths perform. It is
+// the instrumentation Invariant 15 is asserted against: a warm page must touch
+// index entries proportional to its own limit, apply no further stream messages,
+// and read the stream tip exactly once.
+type orderedStats struct {
+	messagesApplied atomic.Uint64
+	indexVisited    atomic.Uint64
+	recordsCopied   atomic.Uint64
+	streamTipReads  atomic.Uint64
+}
+
+// orderedQueryStats is a snapshot of orderedStats. The fields are read
+// independently, so it is not an atomic snapshot; it does not need to be,
+// because the assertions difference two snapshots around one synchronous query.
+type orderedQueryStats struct {
+	// MessagesApplied counts stream messages the views have applied.
+	MessagesApplied uint64
+	// IndexVisited counts sorted-index entries compared, whether while serving a
+	// read or while applying a change. A read's own share is exact whenever
+	// MessagesApplied did not move across the same window.
+	IndexVisited uint64
+	// RecordsCopied counts records copied out into a page.
+	RecordsCopied uint64
+	// StreamTipReads counts barrier captures, which is one per listing call.
+	StreamTipReads uint64
+}
+
+func (s *orderedStats) snapshot() orderedQueryStats {
+	return orderedQueryStats{
+		MessagesApplied: s.messagesApplied.Load(),
+		IndexVisited:    s.indexVisited.Load(),
+		RecordsCopied:   s.recordsCopied.Load(),
+		StreamTipReads:  s.streamTipReads.Load(),
+	}
+}
+
+// OrderedStoreClosedError reports a listing issued against an ordered store
+// whose namespace views have been stopped. It is a permanent, typed refusal
+// rather than a silently empty page: a closed store has no view to be caught up
+// with, so it cannot honestly answer a query at all.
+type OrderedStoreClosedError struct {
+	Namespace string
+}
+
+func (e *OrderedStoreClosedError) Error() string {
+	return "natsstore: ordered store is closed; namespace " + strconv.Quote(e.Namespace) + " has no view"
+}
+
+// OrderedViewStopTimeoutError reports a Close whose context expired before a
+// namespace view's goroutine finished. The goroutine is already cancelled and
+// will exit, so this reports a slow shutdown, not a leak.
+type OrderedViewStopTimeoutError struct {
+	Namespace string
+	Cause     error
+}
+
+func (e *OrderedViewStopTimeoutError) Error() string {
+	return "natsstore: ordered view for namespace " + strconv.Quote(e.Namespace) +
+		" did not stop in time: " + e.Cause.Error()
+}
+
+// Unwrap returns the context error that ended the wait.
+func (e *OrderedViewStopTimeoutError) Unwrap() error { return e.Cause }
+
+// orderedView is one namespace's materialized query view: the current record for
+// every identity, plus three sorted indexes over them.
+//
+// Concurrency: mu guards every map and slice below, and changed is a broadcast
+// channel that is closed and replaced whenever watermark advances or fatal is
+// set, so a barrier waiter can select on it alongside its own context. A
+// condition variable cannot do that — sync.Cond has no cancellable wait — which
+// is why the broadcast is a channel.
+type orderedView struct {
+	namespace string
+	spec      orderedStreamSpec
+	seam      orderedSeam
+	stats     *orderedStats
+	retryBase time.Duration
+
+	// cancel stops the subscription goroutine and done closes when it has
+	// exited. Together they are the shutdown seam Close drives, and the one
+	// F4.4's TestStoreCloseStopsOrderedView asserts against.
+	cancel context.CancelFunc
+	done   chan struct{}
+
+	mu        sync.Mutex
+	changed   chan struct{}
+	watermark uint64
+	// fatal is a sticky, permanent failure of this view: a stream that cannot
+	// serve this layout, or a record payload that cannot be decoded. Both make
+	// every subsequent page a lie by omission, so waiters are failed rather than
+	// served.
+	fatal error
+
+	// records is the current version of every identity in the namespace,
+	// INCLUDING tombstones: ListOrdered is the immutable acceptance-order stream
+	// and must return them.
+	records map[orderedIdentity]storage.OrderedRecord
+	// order indexes each order scope's identities ascending by immutable Order.
+	// Order is strictly increasing within its scope but neither contiguous nor
+	// 1-based (a JetStream sequence is a legitimate allocator), so this is a
+	// sorted slice searched by value, never an array indexed by order.
+	order map[string][]orderedIdentity
+	// ranked indexes each ranking scope's live, ranked identities under
+	// orderedRankedBefore.
+	ranked map[string][]orderedIdentity
+	// due indexes the namespace's live, DueAt identities under orderedDueBefore.
+	due []orderedIdentity
+}
+
+func newOrderedView(namespace string, spec orderedStreamSpec, seam orderedSeam, stats *orderedStats, retryBase time.Duration) *orderedView {
+	return &orderedView{
+		namespace: namespace,
+		spec:      spec,
+		seam:      seam,
+		stats:     stats,
+		retryBase: retryBase,
+		done:      make(chan struct{}),
+		changed:   make(chan struct{}),
+		records:   map[orderedIdentity]storage.OrderedRecord{},
+		order:     map[string][]orderedIdentity{},
+		ranked:    map[string][]orderedIdentity{},
+	}
+}
+
+// start launches the view's single subscription goroutine. Exactly one goroutine
+// exists per open namespace, and stop is the only way it ends.
+func (v *orderedView) start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	v.cancel = cancel
+	go v.run(ctx)
+}
+
+// stop cancels the subscription and waits for the goroutine to exit, so a caller
+// that closes the store can prove no view goroutine outlives it.
+func (v *orderedView) stop(ctx context.Context) error {
+	v.cancel()
+	select {
+	case <-v.done:
+		return nil
+	case <-ctx.Done():
+		return &OrderedViewStopTimeoutError{Namespace: v.namespace, Cause: ctx.Err()}
+	}
+}
+
+// run keeps a subscription attached for the life of the view. A failed attach is
+// retried with the same jittered backoff the create path uses; a stream that
+// cannot serve this layout is fatal and ends the goroutine, because retrying it
+// would only park every reader on a barrier that can never be reached.
+//
+// Re-attaching restarts from DeliverLastPerSubject, which is a COMPLETE refresh
+// of the namespace's current state, so a gap in the subscription cannot leave
+// the view holding a stale record. Redelivery of a head the view already has is
+// a no-op (see applyRecord).
+func (v *orderedView) run(ctx context.Context) {
+	defer close(v.done)
+	attempt := 0
+	for {
+		err := v.seam.watchStream(ctx, v.spec, v.applyMessage)
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			var configErr *OrderedStreamConfigError
+			if errors.As(err, &configErr) {
+				v.setFatal(err)
+				return
+			}
+			attempt++
+		} else {
+			attempt = 0
+		}
+		if waitErr := orderedBackoff(ctx, v.retryBase, attempt-1, orderedViewRetryMaxShift); waitErr != nil {
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+	}
+}
+
+// applyMessage folds one stream message into the view. It is the ONLY writer of
+// view state; every mutation the store performs reaches the view the same way a
+// remote process's mutation does, through the stream.
+func (v *orderedView) applyMessage(subject string, seq uint64, data []byte) {
+	v.stats.messagesApplied.Add(1)
+	family, err := classifyOrderedSubject(v.namespace, subject)
+	if err != nil {
+		v.setFatal(err)
+		return
+	}
+	if family == orderedRecordSubjectFamily {
+		record, err := decodeOrderedRecord(subject, data)
+		if err != nil {
+			// A record subject whose payload will not decode is authoritative
+			// state this process cannot represent. Skipping it would serve pages
+			// that silently omit a record, which is exactly the failure mode the
+			// codec's fail-closed rule exists to prevent, so the view refuses to
+			// answer for this namespace until the stream is repaired.
+			v.setFatal(err)
+			return
+		}
+		v.applyRecord(record)
+	}
+	// Counter subjects, and any family this layout does not define, carry no
+	// view state — but they DO carry stream sequences a barrier waits for, so
+	// they advance the watermark like anything else.
+	v.advance(seq)
+}
+
+// applyRecord upserts one record and repositions it in every index it belongs
+// to. A revision no newer than the one already held is ignored, which is what
+// makes redelivery — inherent to re-attaching a subscription — idempotent.
+func (v *orderedView) applyRecord(record storage.OrderedRecord) {
+	key := orderedIdentity{orderingScope: record.ID.OrderingScope, stableKey: record.ID.StableKey}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	previous, had := v.records[key]
+	if had && record.Revision <= previous.Revision {
+		return
+	}
+	if had {
+		// Remove against the PREVIOUS record, while v.records still holds it, so
+		// the search runs against the keys the index was actually sorted by.
+		v.removeCurrentLocked(key, previous)
+	}
+	v.records[key] = record
+	if !had {
+		// Order is immutable, so an existing record never moves in this index.
+		v.insertOrderLocked(key, record)
+	}
+	v.insertCurrentLocked(key, record)
+}
+
+// advance raises the watermark and wakes every barrier waiter. The watermark is
+// monotonic: a re-attach replays heads with sequences the view has already
+// passed, and a barrier that had been satisfied must never become unsatisfied.
+func (v *orderedView) advance(seq uint64) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if seq <= v.watermark {
+		return
+	}
+	v.watermark = seq
+	v.broadcastLocked()
+}
+
+func (v *orderedView) setFatal(err error) {
+	v.mu.Lock()
+	if v.fatal == nil {
+		v.fatal = err
+		v.broadcastLocked()
+	}
+	v.mu.Unlock()
+	// The view can no longer answer, so it must not keep a server-side consumer
+	// alive either. Cancelling here is safe outside the lock and idempotent.
+	v.cancel()
+}
+
+// broadcastLocked wakes every barrier waiter by closing the current generation
+// channel and installing the next one. The caller must hold v.mu.
+func (v *orderedView) broadcastLocked() {
+	close(v.changed)
+	v.changed = make(chan struct{})
+}
+
+func (v *orderedView) currentWatermark() uint64 {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.watermark
+}
+
+func (v *orderedView) recordCount() int {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return len(v.records)
+}
+
+// waitBarrier blocks until the view has applied every message through target.
+// This is the "caught up before read" guarantee: target is the stream tip the
+// caller captured before the query began, so returning means the view reflects
+// at least the state that existed at the start of the call.
+//
+// It always terminates. MaxMsgsPerSubject=1 removes a message only when a NEWER
+// message is published on the same subject, and that replacement carries a
+// higher sequence, so the sequence the view can reach is never capped below a
+// tip that once existed.
+//
+// A target of zero — an absent or empty stream — is satisfied immediately,
+// without waiting for the view to have attached. That is not a shortcut: a
+// stream holding nothing has no record a page could omit, so an empty page is
+// the complete and correct answer, and blocking on a subscription to a stream
+// that may not even exist yet would turn every read of an unwritten namespace
+// into a wait for a deadline.
+func (v *orderedView) waitBarrier(ctx context.Context, target uint64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	for {
+		v.mu.Lock()
+		if v.fatal != nil {
+			err := v.fatal
+			v.mu.Unlock()
+			return err
+		}
+		if v.watermark >= target {
+			v.mu.Unlock()
+			return nil
+		}
+		changed := v.changed
+		v.mu.Unlock()
+
+		select {
+		case <-changed:
+		case <-v.done:
+			// The view stopped without reaching the barrier, so the only honest
+			// answer is the reason it stopped, or the closure itself.
+			v.mu.Lock()
+			err := v.fatal
+			v.mu.Unlock()
+			if err != nil {
+				return err
+			}
+			return &OrderedStoreClosedError{Namespace: v.namespace}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// --- sorted index maintenance and search ------------------------------------
+
+// lowerBoundLocked returns the first index whose record does NOT sort before
+// probe: the position probe belongs at. The caller must hold v.mu.
+func (v *orderedView) lowerBoundLocked(entries []orderedIdentity, before orderedComparator, probe storage.OrderedRecord) int {
+	low, high := 0, len(entries)
+	for low < high {
+		middle := low + (high-low)/2
+		v.stats.indexVisited.Add(1)
+		if before(v.records[entries[middle]], probe) {
+			low = middle + 1
+		} else {
+			high = middle
+		}
+	}
+	return low
+}
+
+// upperBoundLocked returns the first index whose record sorts strictly AFTER
+// probe. It is the cursor-resume search: a cursor names a position, the page
+// after it starts at the first record beyond that position, and the comparison
+// is the same orderedComparator that built the index. The caller must hold v.mu.
+func (v *orderedView) upperBoundLocked(entries []orderedIdentity, before orderedComparator, probe storage.OrderedRecord) int {
+	low, high := 0, len(entries)
+	for low < high {
+		middle := low + (high-low)/2
+		v.stats.indexVisited.Add(1)
+		if before(probe, v.records[entries[middle]]) {
+			high = middle
+		} else {
+			low = middle + 1
+		}
+	}
+	return low
+}
+
+// locateLocked finds key's exact position in a sorted index. Both sort keys are
+// injective over the identities in one index — (rank, stable_key,
+// ordering_scope) and (due_at, stable_key, ordering_scope) each determine the
+// identity within a fixed namespace and scope — so the lower bound already IS
+// the entry, and the forward scan below can advance only past records that
+// compare equal to it, of which there are none. It is written as a scan anyway
+// so the code does not depend on that argument being restated correctly at every
+// call site. The caller must hold v.mu.
+func (v *orderedView) locateLocked(entries []orderedIdentity, before orderedComparator, record storage.OrderedRecord, key orderedIdentity) (int, bool) {
+	at := v.lowerBoundLocked(entries, before, record)
+	for at < len(entries) && !before(record, v.records[entries[at]]) {
+		if entries[at] == key {
+			return at, true
+		}
+		at++
+	}
+	return 0, false
+}
+
+// removeCurrentLocked takes a record out of the two current-state indexes it may
+// occupy. The caller must hold v.mu, and v.records must still hold previous.
+func (v *orderedView) removeCurrentLocked(key orderedIdentity, previous storage.OrderedRecord) {
+	if !previous.Deleted && previous.Rank.Ranked {
+		entries := v.ranked[previous.RankingScope]
+		if at, ok := v.locateLocked(entries, orderedRankedBefore, previous, key); ok {
+			v.ranked[previous.RankingScope] = slices.Delete(entries, at, at+1)
+		}
+	}
+	if !previous.Deleted && previous.Due.State == storage.DueAt {
+		if at, ok := v.locateLocked(v.due, orderedDueBefore, previous, key); ok {
+			v.due = slices.Delete(v.due, at, at+1)
+		}
+	}
+}
+
+// insertCurrentLocked places a record into the current-state indexes it belongs
+// to. A tombstone belongs to neither: it is unranked and canonically not-due, so
+// deleting a record removes it from both views while leaving the acceptance-order
+// stream untouched. The caller must hold v.mu.
+//
+// The Deleted guards below are redundant TODAY and kept deliberately. Delete
+// clears Rank and Due, and decodeOrderedRecord runs ValidateOrderedRecord, which
+// rejects a deleted record carrying either — so no tombstone can reach these
+// branches with Ranked or DueAt set, and no test can distinguish their removal.
+// They state the rule the indexes depend on at the point that depends on it,
+// rather than relying on a validator three call frames away staying that strict.
+func (v *orderedView) insertCurrentLocked(key orderedIdentity, record storage.OrderedRecord) {
+	if !record.Deleted && record.Rank.Ranked {
+		entries := v.ranked[record.RankingScope]
+		at := v.lowerBoundLocked(entries, orderedRankedBefore, record)
+		v.ranked[record.RankingScope] = slices.Insert(entries, at, key)
+	}
+	if !record.Deleted && record.Due.State == storage.DueAt {
+		at := v.lowerBoundLocked(v.due, orderedDueBefore, record)
+		v.due = slices.Insert(v.due, at, key)
+	}
+}
+
+// insertOrderLocked places a newly seen identity in its order scope's ascending
+// acceptance stream. The caller must hold v.mu.
+func (v *orderedView) insertOrderLocked(key orderedIdentity, record storage.OrderedRecord) {
+	entries := v.order[key.orderingScope]
+	at := v.orderLowerBoundLocked(entries, record.Order)
+	v.order[key.orderingScope] = slices.Insert(entries, at, key)
+}
+
+// orderLowerBoundLocked returns the first index whose immutable order is at
+// least order. It compares one scalar rather than a tuple, so it is not a second
+// statement of either frozen sort key. The caller must hold v.mu.
+func (v *orderedView) orderLowerBoundLocked(entries []orderedIdentity, order uint64) int {
+	low, high := 0, len(entries)
+	for low < high {
+		middle := low + (high-low)/2
+		v.stats.indexVisited.Add(1)
+		if v.records[entries[middle]].Order < order {
+			low = middle + 1
+		} else {
+			high = middle
+		}
+	}
+	return low
+}
+
+// dueEndLocked returns the first index whose due time is later than bound, which
+// is where an inclusive ListDue page must stop. The caller must hold v.mu.
+func (v *orderedView) dueEndLocked(bound int64) int {
+	low, high := 0, len(v.due)
+	for low < high {
+		middle := low + (high-low)/2
+		v.stats.indexVisited.Add(1)
+		if v.records[v.due[middle]].Due.UnixMillis <= bound {
+			low = middle + 1
+		} else {
+			high = middle
+		}
+	}
+	return low
+}
+
+// collectLocked copies a run of index entries out as caller-owned records. The
+// caller must hold v.mu.
+func (v *orderedView) collectLocked(entries []orderedIdentity) []storage.OrderedRecord {
+	records := make([]storage.OrderedRecord, 0, len(entries))
+	for _, key := range entries {
+		v.stats.indexVisited.Add(1)
+		v.stats.recordsCopied.Add(1)
+		record := v.records[key]
+		record.Value = bytes.Clone(record.Value)
+		records = append(records, record)
+	}
+	return records
+}
+
+// --- listings ---------------------------------------------------------------
+
+var _ storage.OrderedIndex = (*orderedStore)(nil)
+
+// orderedNamespaceSpec resolves a validated namespace's stream and subject
+// filter. It is orderedLocation's namespace-only half, for the read paths, which
+// have no identity to resolve.
+func orderedNamespaceSpec(namespace string) (orderedStreamSpec, error) {
+	stream, err := orderedStreamName(namespace)
+	if err != nil {
+		return orderedStreamSpec{}, err
+	}
+	filter, err := orderedSubjectFilter(namespace)
+	if err != nil {
+		return orderedStreamSpec{}, err
+	}
+	return orderedStreamSpec{stream: stream, subjectFilter: filter}, nil
+}
+
+// view returns the namespace's view, starting it on first use. One view, one
+// goroutine, one subscription per OPEN namespace: a namespace becomes open when
+// it is first queried and stays open until Close.
+func (s *orderedStore) view(namespace string) (*orderedView, error) {
+	spec, err := orderedNamespaceSpec(namespace)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, &OrderedStoreClosedError{Namespace: namespace}
+	}
+	if view, ok := s.views[namespace]; ok {
+		return view, nil
+	}
+	view := newOrderedView(namespace, spec, s.seam, s.stats, s.viewRetryBase)
+	s.views[namespace] = view
+	view.start()
+	return view, nil
+}
+
+// readyView returns a view that has applied through the stream tip observed at
+// the start of this call. Capturing the tip BEFORE waiting is what makes the
+// guarantee meaningful: a tip captured afterwards would only prove the view was
+// caught up with some earlier moment.
+func (s *orderedStore) readyView(ctx context.Context, namespace string) (*orderedView, error) {
+	view, err := s.view(namespace)
+	if err != nil {
+		return nil, err
+	}
+	s.stats.streamTipReads.Add(1)
+	tip, err := s.seam.streamTip(ctx, view.spec.stream)
+	if err != nil {
+		return nil, err
+	}
+	if err := view.waitBarrier(ctx, tip); err != nil {
+		return nil, err
+	}
+	return view, nil
+}
+
+// queryStats reports the query-work counters. It exists for this module's own
+// bounded-work assertions and for the counter probe F4.4 supplies to the storage
+// conformance suite.
+func (s *orderedStore) queryStats() orderedQueryStats { return s.stats.snapshot() }
+
+// Close stops every open namespace view. It is idempotent, and it waits for each
+// goroutine to exit so a caller can prove none outlives the store. F4.4 wires it
+// into the composite's lifecycle; nothing may start a view afterwards.
+func (s *orderedStore) Close(ctx context.Context) error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	s.closed = true
+	views := make([]*orderedView, 0, len(s.views))
+	for _, view := range s.views {
+		views = append(views, view)
+	}
+	clear(s.views)
+	s.mu.Unlock()
+
+	for _, view := range views {
+		if err := view.stop(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ListOrdered pages the immutable acceptance-order stream of one order scope,
+// ascending after the exclusive afterOrder. It INCLUDES tombstones: this is the
+// acceptance history, not a current view, and a consumer resuming from an order
+// cursor has to see that a record was deleted.
+func (s *orderedStore) ListOrdered(ctx context.Context, namespace string, orderingScope string, afterOrder uint64, limit int) (storage.OrderedPage, error) {
+	if err := storage.ValidateName(namespace); err != nil {
+		return storage.OrderedPage{}, err
+	}
+	if err := storage.ValidateName(orderingScope); err != nil {
+		return storage.OrderedPage{}, err
+	}
+	if err := storage.ValidateOrderedLimit(limit); err != nil {
+		return storage.OrderedPage{}, err
+	}
+	view, err := s.readyView(ctx, namespace)
+	if err != nil {
+		return storage.OrderedPage{}, err
+	}
+
+	view.mu.Lock()
+	defer view.mu.Unlock()
+	entries := view.order[orderingScope]
+	// afterOrder is exclusive, so the page starts at the first order strictly
+	// greater than it: the lower bound of afterOrder+1. The maximal order is
+	// handled separately because afterOrder+1 would wrap to zero there, and
+	// zero is the "start at the beginning" argument.
+	start := len(entries)
+	if afterOrder != math.MaxUint64 {
+		start = view.orderLowerBoundLocked(entries, afterOrder+1)
+	}
+	end := min(start+limit, len(entries))
+	page := storage.OrderedPage{Records: view.collectLocked(entries[start:end])}
+	if len(page.Records) > 0 {
+		page.NextAfterOrder = page.Records[len(page.Records)-1].Order
+	}
+	return page, nil
+}
+
+// ListRanked pages one ranking scope's current, nondeleted, ranked records in
+// descending (rank, stable_key, ordering_scope) order.
+//
+// Pagination is keyset, over a view that keeps moving. A record whose rank
+// crosses the cursor's frozen position between two pages is skipped or returned
+// twice; that is inherent to resuming from a position rather than from a
+// snapshot, it is what the contract specifies, and callers reconcile by stable
+// identity rather than by page.
+func (s *orderedStore) ListRanked(ctx context.Context, namespace string, rankingScope string, after storage.RankedCursor, limit int) (storage.RankedPage, error) {
+	if err := storage.ValidateName(namespace); err != nil {
+		return storage.RankedPage{}, err
+	}
+	if err := storage.ValidateName(rankingScope); err != nil {
+		return storage.RankedPage{}, err
+	}
+	if err := storage.ValidateOrderedLimit(limit); err != nil {
+		return storage.RankedPage{}, err
+	}
+	probe, resuming, err := decodeRankedCursor(after, namespace, rankingScope)
+	if err != nil {
+		return storage.RankedPage{}, err
+	}
+	view, err := s.readyView(ctx, namespace)
+	if err != nil {
+		return storage.RankedPage{}, err
+	}
+
+	view.mu.Lock()
+	defer view.mu.Unlock()
+	entries := view.ranked[rankingScope]
+	start := 0
+	if resuming {
+		start = view.upperBoundLocked(entries, orderedRankedBefore, probe)
+	}
+	end := min(start+limit, len(entries))
+	page := storage.RankedPage{Records: view.collectLocked(entries[start:end])}
+	if end < len(entries) {
+		last := page.Records[len(page.Records)-1]
+		token, err := encodeOrderedCursor(orderedCursorPayload{
+			Kind:          string(storage.RankedCursorKind),
+			Namespace:     namespace,
+			RankingScope:  rankingScope,
+			Rank:          last.Rank.Value,
+			StableKey:     string(last.ID.StableKey),
+			OrderingScope: last.ID.OrderingScope,
+		})
+		if err != nil {
+			return storage.RankedPage{}, err
+		}
+		page.NextCursor = storage.RankedCursor(token)
+	}
+	return page, nil
+}
+
+// ListDue pages the namespace's current, nondeleted, DueAt records with a due
+// time no later than dueAtOrBefore, ascending by (due_at, stable_key,
+// ordering_scope). The same keyset caveat as ListRanked applies to a record
+// whose due time moves across the cursor between pages.
+func (s *orderedStore) ListDue(ctx context.Context, namespace string, dueAtOrBefore int64, after storage.DueCursor, limit int) (storage.DuePage, error) {
+	if err := storage.ValidateName(namespace); err != nil {
+		return storage.DuePage{}, err
+	}
+	if err := storage.ValidateOrderedLimit(limit); err != nil {
+		return storage.DuePage{}, err
+	}
+	probe, resuming, err := decodeDueCursor(after, namespace, dueAtOrBefore)
+	if err != nil {
+		return storage.DuePage{}, err
+	}
+	view, err := s.readyView(ctx, namespace)
+	if err != nil {
+		return storage.DuePage{}, err
+	}
+
+	view.mu.Lock()
+	defer view.mu.Unlock()
+	start := 0
+	if resuming {
+		start = view.upperBoundLocked(view.due, orderedDueBefore, probe)
+	}
+	eligible := view.dueEndLocked(dueAtOrBefore)
+	start = min(start, eligible)
+	end := min(start+limit, eligible)
+	page := storage.DuePage{Records: view.collectLocked(view.due[start:end])}
+	if end < eligible {
+		last := page.Records[len(page.Records)-1]
+		token, err := encodeOrderedCursor(orderedCursorPayload{
+			Kind:          string(storage.DueCursorKind),
+			Namespace:     namespace,
+			DueBound:      dueAtOrBefore,
+			DueAt:         last.Due.UnixMillis,
+			StableKey:     string(last.ID.StableKey),
+			OrderingScope: last.ID.OrderingScope,
+		})
+		if err != nil {
+			return storage.DuePage{}, err
+		}
+		page.NextCursor = storage.DueCursor(token)
+	}
+	return page, nil
+}
+
+// decodeRankedCursor turns an opaque token into the PROBE RECORD the ranked
+// comparator searches for. Returning a record rather than a bespoke position
+// type is deliberate: it is what lets the resume path use orderedRankedBefore
+// itself, so the descending sort key — including both tiebreakers — is written
+// down exactly once in this package.
+//
+// Every binding is re-checked against the live request. The token is never
+// trusted for namespace or ranking scope; it carries a position, not authority.
+func decodeRankedCursor(cursor storage.RankedCursor, namespace, rankingScope string) (storage.OrderedRecord, bool, error) {
+	if cursor == "" {
+		return storage.OrderedRecord{}, false, nil
+	}
+	payload, err := decodeOrderedCursorPayload(storage.RankedCursorKind, string(cursor))
+	if err != nil {
+		return storage.OrderedRecord{}, false, err
+	}
+	if payload.Namespace != namespace || payload.RankingScope != rankingScope {
+		return storage.OrderedRecord{}, false, storage.NewInvalidOrderedCursorError(
+			storage.RankedCursorKind, string(cursor), storage.OrderedCursorQueryMismatch)
+	}
+	return storage.OrderedRecord{
+		ID: storage.OrderedID{
+			Namespace:     payload.Namespace,
+			OrderingScope: payload.OrderingScope,
+			StableKey:     storage.StableKey(payload.StableKey),
+		},
+		RankingScope: payload.RankingScope,
+		Rank:         storage.Rank{Ranked: true, Value: payload.Rank},
+	}, true, nil
+}
+
+// decodeDueCursor is decodeRankedCursor's ascending counterpart. The fixed due
+// bound is part of the binding: a page issued under one bound resumes only under
+// that same bound, because the eligible end of the index moves with it.
+func decodeDueCursor(cursor storage.DueCursor, namespace string, dueAtOrBefore int64) (storage.OrderedRecord, bool, error) {
+	if cursor == "" {
+		return storage.OrderedRecord{}, false, nil
+	}
+	payload, err := decodeOrderedCursorPayload(storage.DueCursorKind, string(cursor))
+	if err != nil {
+		return storage.OrderedRecord{}, false, err
+	}
+	if payload.Namespace != namespace || payload.DueBound != dueAtOrBefore {
+		return storage.OrderedRecord{}, false, storage.NewInvalidOrderedCursorError(
+			storage.DueCursorKind, string(cursor), storage.OrderedCursorQueryMismatch)
+	}
+	return storage.OrderedRecord{
+		ID: storage.OrderedID{
+			Namespace:     payload.Namespace,
+			OrderingScope: payload.OrderingScope,
+			StableKey:     storage.StableKey(payload.StableKey),
+		},
+		Due: storage.Due{State: storage.DueAt, UnixMillis: payload.DueAt},
+	}, true, nil
 }

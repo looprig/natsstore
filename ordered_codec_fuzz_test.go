@@ -3,6 +3,8 @@ package natsstore
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 
 	"github.com/looprig/storage"
@@ -119,6 +121,87 @@ func FuzzDecodeOrderedRecord(f *testing.F) {
 			again.Due != rec.Due || again.Rank != rec.Rank || again.Deleted != rec.Deleted ||
 			again.RankingScope != rec.RankingScope || !bytes.Equal(again.Value, rec.Value) {
 			t.Fatalf("round trip changed the record: %+v then %+v", rec, again)
+		}
+	})
+}
+
+// minFuzzCursorEchoBytes is the shortest token for which "the error does not
+// contain the token" is a meaningful assertion rather than a coincidence.
+const minFuzzCursorEchoBytes = 16
+
+// FuzzDecodeOrderedCursor drives the continuation-cursor decoder with arbitrary
+// bytes. A cursor is the only value in this package that arrives from outside
+// with no fence, no hash, and no signature behind it, so the properties asserted
+// here are the whole of its safety:
+//
+//   - it never panics, whatever the bytes;
+//   - it never accepts a token for the wrong cursor kind;
+//   - every rejection carries one of the contract's four fail-closed rules, for
+//     the kind that was asked for; and
+//   - it never echoes the token back through the error, which is what keeps an
+//     opaque cursor opaque.
+//
+// The corpus is seeded with real tokens so the fuzzer starts from inside the
+// grammar and mutates outwards, rather than spending its budget proving that
+// random bytes are not base64.
+func FuzzDecodeOrderedCursor(f *testing.F) {
+	seeds := []orderedCursorPayload{
+		{Kind: string(storage.RankedCursorKind), Namespace: "ns", RankingScope: "rs", Rank: 7, StableKey: "key", OrderingScope: "os"},
+		{Kind: string(storage.DueCursorKind), Namespace: "a/b.c", DueBound: -1, DueAt: 1 << 40, StableKey: "K/ey.Ü", OrderingScope: "s/1"},
+	}
+	for _, payload := range seeds {
+		token, err := encodeOrderedCursor(payload)
+		if err != nil {
+			f.Fatalf("encodeOrderedCursor(%+v): %v", payload, err)
+		}
+		f.Add(token)
+	}
+	f.Add("")
+	f.Add("oi1.")
+	f.Add(orderedMalformedCursorToken(storage.RankedCursorKind))
+	f.Add(orderedUnknownVersionCursorToken(storage.DueCursorKind))
+
+	// Both kinds are checked inside one fuzz body: a testing.F accepts exactly
+	// one Fuzz call, and running the two kinds over the same input is also what
+	// exposes a token that both kinds would accept.
+	f.Fuzz(func(t *testing.T, token string) {
+		for _, kind := range []storage.OrderedCursorKind{storage.RankedCursorKind, storage.DueCursorKind} {
+			payload, err := decodeOrderedCursorPayload(kind, token)
+			if err == nil {
+				if payload.Kind != string(kind) {
+					t.Fatalf("decode(%s) accepted a %q cursor", kind, payload.Kind)
+				}
+				// An accepted token must round-trip to itself, which is what
+				// makes a resumed position the one that was issued.
+				again, encodeErr := encodeOrderedCursor(payload)
+				if encodeErr != nil {
+					t.Fatalf("re-encoding an accepted cursor failed: %v", encodeErr)
+				}
+				if _, decodeErr := decodeOrderedCursorPayload(kind, again); decodeErr != nil {
+					t.Fatalf("re-encoded cursor was rejected: %v", decodeErr)
+				}
+				return
+			}
+			var invalid *storage.InvalidOrderedCursorError
+			if !errors.As(err, &invalid) {
+				t.Fatalf("decode(%s) rejected with %T %v, want *InvalidOrderedCursorError", kind, err, err)
+			}
+			if invalid.Kind != kind {
+				t.Fatalf("decode(%s) rejection reported kind %q", kind, invalid.Kind)
+			}
+			switch invalid.Rule {
+			case storage.OrderedCursorMalformed, storage.OrderedCursorUnknownVersion,
+				storage.OrderedCursorWrongKind, storage.OrderedCursorQueryMismatch:
+			default:
+				t.Fatalf("decode(%s) rejection carried unclassified rule %v", kind, invalid.Rule)
+			}
+			// Only tokens long enough to be distinctive are checked: a
+			// one-byte token is a substring of the error's own prose by
+			// coincidence, which is why storetest imposes the same minimum on
+			// the probe tokens a provider supplies.
+			if len(token) >= minFuzzCursorEchoBytes && strings.Contains(err.Error(), token) {
+				t.Fatalf("decode(%s) echoed the rejected token back through its error", kind)
+			}
 		}
 	})
 }

@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
@@ -495,4 +496,159 @@ func isOrderedAmbiguous(err error) bool {
 		errors.Is(err, nats.ErrNoResponders) ||
 		errors.Is(err, nats.ErrNoStreamResponse) ||
 		errors.Is(err, jetstream.ErrNoStreamResponse)
+}
+
+// orderedViewInactiveThreshold bounds how long the server keeps a view's
+// ephemeral consumer alive after this process stops pulling from it. A crashed
+// or partitioned reader therefore costs the server one consumer for at most this
+// long, and a healthy one refreshes it continuously.
+const orderedViewInactiveThreshold = 30 * time.Second
+
+// orderedViewTeardownTimeout bounds the best-effort consumer deletion a view
+// performs when its subscription ends.
+const orderedViewTeardownTimeout = 5 * time.Second
+
+// streamTip returns the stream's last stored sequence — the barrier a query
+// waits for its view to reach. An absent stream reports 0, which is the same
+// "nothing has been written here" answer lastMsgForSubject gives, so a read of a
+// namespace that has never been created is a bounded, empty, error-free page.
+func (s *jetStreamOrderedSeam) streamTip(ctx context.Context, streamName string) (uint64, error) {
+	stream, err := s.freshStream(ctx, streamName)
+	if err != nil || stream == nil {
+		return 0, err
+	}
+	info := stream.CachedInfo()
+	if info == nil {
+		return 0, &OrderedStreamOpError{Stream: streamName, Op: "info", Cause: jetstream.ErrInvalidJetStreamResponse}
+	}
+	return info.State.LastSeq, nil
+}
+
+// freshStream resolves an UNSHARED stream handle already carrying the server's
+// current StreamInfo, or (nil, nil) when the stream does not exist.
+//
+// It deliberately bypasses the seam's handle cache, and the reason is a real
+// hazard rather than caution: jetstream's stream.Info WRITES the info field of
+// the handle it is called on, and getMsg — the call behind lastMsgForSubject —
+// READS that same field. A shared handle is therefore safe only while nobody
+// asks it for info. The mutation paths never do (ensureStream reads info once,
+// before publishing the handle to the cache), so the read paths take their own
+// handle rather than poisoning the shared one. It costs exactly the round trip
+// an Info call would have cost anyway.
+//
+// A read also never PROVISIONS: an unwritten namespace is an empty view, not a
+// new stream. Only a mutation creates one, through ensureStream.
+func (s *jetStreamOrderedSeam) freshStream(ctx context.Context, streamName string) (jetstream.Stream, error) {
+	stream, err := s.js.Stream(ctx, streamName)
+	if errors.Is(err, jetstream.ErrStreamNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, &OrderedStreamOpError{Stream: streamName, Op: "lookup", Cause: err}
+	}
+	return stream, nil
+}
+
+// watchStream feeds one namespace view. It binds an ORDERED ephemeral consumer
+// with DeliverLastPerSubject, which is the only delivery policy that matches
+// what an ordered stream actually holds: MaxMsgsPerSubject=1 means the stream
+// retains exactly the current head of every counter and record subject and no
+// history at all, so "the last message per subject" IS the namespace's state.
+// The consumer then tails the stream, so the view stays current without any
+// caller ever enumerating subjects (Invariant 15).
+//
+// It verifies the stream's layout before subscribing. A stream that cannot serve
+// this layout returns *OrderedStreamConfigError, which the view treats as fatal
+// rather than retrying forever against a stream that will never be right.
+//
+// It returns when ctx ends (nil) or when the subscription fails in a way the
+// ordered consumer's own reset could not absorb, at which point the caller
+// re-attaches. Re-attaching re-runs DeliverLastPerSubject, which is a complete
+// refresh of current state and therefore cannot lose an update.
+func (s *jetStreamOrderedSeam) watchStream(ctx context.Context, spec orderedStreamSpec, apply func(subject string, seq uint64, data []byte)) error {
+	stream, err := s.freshStream(ctx, spec.stream)
+	if err != nil {
+		return err
+	}
+	if stream == nil {
+		// A namespace nothing has written yet. Its tip is 0, so no barrier is
+		// waiting on this view; reporting it lets the caller retry until the
+		// stream appears.
+		return &OrderedStreamOpError{Stream: spec.stream, Op: "watch", Cause: jetstream.ErrStreamNotFound}
+	}
+	info := stream.CachedInfo()
+	if info == nil {
+		return &OrderedStreamOpError{Stream: spec.stream, Op: "info", Cause: jetstream.ErrInvalidJetStreamResponse}
+	}
+	if err := verifyOrderedStreamConfig(spec, info.Config); err != nil {
+		return err
+	}
+	consumer, err := stream.OrderedConsumer(ctx, jetstream.OrderedConsumerConfig{
+		FilterSubjects:    []string{spec.subjectFilter},
+		DeliverPolicy:     jetstream.DeliverLastPerSubjectPolicy,
+		ReplayPolicy:      jetstream.ReplayInstantPolicy,
+		InactiveThreshold: orderedViewInactiveThreshold,
+	})
+	if err != nil {
+		return &OrderedStreamOpError{Stream: spec.stream, Op: "watch consumer", Cause: err}
+	}
+	defer releaseOrderedViewConsumer(ctx, stream, consumer)
+
+	// Buffered by one: the handler must never block on a receiver that has
+	// already returned, and only the first failure matters.
+	failures := make(chan error, 1)
+	report := func(op string, cause error) {
+		select {
+		case failures <- &OrderedStreamOpError{Stream: spec.stream, Op: op, Cause: cause}:
+		default:
+		}
+	}
+	consumeCtx, err := consumer.Consume(func(msg jetstream.Msg) {
+		meta, err := msg.Metadata()
+		if err != nil {
+			// A message whose metadata will not parse carries no stream
+			// sequence, so it can neither be applied nor counted towards a
+			// barrier. Reporting it re-attaches the subscription, which is the
+			// only recovery available.
+			report("watch metadata", err)
+			return
+		}
+		apply(msg.Subject(), meta.Sequence.Stream, msg.Data())
+	}, jetstream.ConsumeErrHandler(func(_ jetstream.ConsumeContext, err error) {
+		report("watch", err)
+	}))
+	if err != nil {
+		return &OrderedStreamOpError{Stream: spec.stream, Op: "watch consume", Cause: err}
+	}
+	defer consumeCtx.Stop()
+
+	select {
+	case <-ctx.Done():
+		return nil
+	case <-consumeCtx.Closed():
+		return &OrderedStreamOpError{Stream: spec.stream, Op: "watch", Cause: jetstream.ErrConsumerNotFound}
+	case err := <-failures:
+		return err
+	}
+}
+
+// releaseOrderedViewConsumer drops the view's ephemeral consumer as soon as the
+// subscription ends, rather than leaving it for the server to reclaim after
+// orderedViewInactiveThreshold. It runs with its own short-lived context because
+// the usual reason a watch ends is that ITS context was cancelled.
+//
+// A failure here is deliberately not propagated and not retried: the consumer is
+// ephemeral and already unsubscribed, so the inactivity threshold reclaims it
+// regardless, and the caller — a view that is shutting down or re-attaching —
+// has nothing it could do with the error.
+func releaseOrderedViewConsumer(ctx context.Context, stream jetstream.Stream, consumer jetstream.Consumer) {
+	info := consumer.CachedInfo()
+	if info == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), orderedViewTeardownTimeout)
+	defer cancel()
+	if err := stream.DeleteConsumer(ctx, info.Name); err != nil {
+		return
+	}
 }

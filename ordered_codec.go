@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strconv"
+	"strings"
 
 	"github.com/looprig/storage"
 )
@@ -307,4 +308,189 @@ func decodeOrderedCounter(data []byte) (uint64, error) {
 		return 0, &OrderedCounterError{Value: bytes.Clone(data), Reason: "not a canonical decimal order"}
 	}
 	return order, nil
+}
+
+// --- subject classification ------------------------------------------------
+
+// orderedSubjectFamily discriminates the subject families inside one namespace's
+// stream. A view consumes every subject the stream holds, so it must decide what
+// each one is before deciding what to do with it.
+type orderedSubjectFamily uint8
+
+const (
+	// orderedForeignSubject is a subject outside this namespace's space, or one
+	// naming a family this layout version does not define.
+	orderedForeignSubject orderedSubjectFamily = iota
+	// orderedCounterSubjectFamily is a per-order-scope order counter.
+	orderedCounterSubjectFamily
+	// orderedRecordSubjectFamily is one record's current version.
+	orderedRecordSubjectFamily
+)
+
+// classifyOrderedSubject reports which family subject belongs to within
+// namespace. It matches on the family token alone and does not attempt to
+// recover the ordering scope or the identity: the identity is a hash, and the
+// authoritative copy of every identity component is inside the payload, where
+// decodeOrderedRecord verifies it against this same subject.
+func classifyOrderedSubject(namespace, subject string) (orderedSubjectFamily, error) {
+	prefix, err := orderedNamespacePrefix(namespace)
+	if err != nil {
+		return orderedForeignSubject, err
+	}
+	rest, ok := strings.CutPrefix(subject, prefix+".")
+	if !ok {
+		return orderedForeignSubject, nil
+	}
+	token, _, ok := strings.Cut(rest, ".")
+	if !ok {
+		return orderedForeignSubject, nil
+	}
+	switch token {
+	case orderedCounterToken:
+		return orderedCounterSubjectFamily, nil
+	case orderedRecordToken:
+		return orderedRecordSubjectFamily, nil
+	default:
+		return orderedForeignSubject, nil
+	}
+}
+
+// --- continuation cursors --------------------------------------------------
+
+// orderedCursorVersion is the token version this package issues and the only one
+// it accepts. It is carried as a plaintext prefix rather than inside the encoded
+// body so that a token from a FUTURE version is classified as an unknown version
+// instead of decode-failing as malformed — the two are distinct fail-closed
+// rules, and a caller upgrading across versions needs to tell them apart.
+const orderedCursorVersion = 1
+
+// orderedCursorPrefix marks this package's cursors. A token is
+// "oi" + decimal version + "." + base64url(payload).
+const orderedCursorPrefix = "oi"
+
+// maxOrderedCursorBytes caps an untrusted token before any decoding, so a hostile
+// cursor cannot drive an unbounded allocation. It is far above the largest token
+// this package issues: the payload is a bounded namespace, two bounded scopes, a
+// 256-byte stable key, and three integers.
+const maxOrderedCursorBytes = 8 << 10
+
+// orderedCursorPayload is the decoded position a continuation token carries. It
+// is deliberately ONE type for both cursor kinds: the two kinds share their
+// query binding (namespace) and their tiebreakers (stable key, ordering scope),
+// and a single type keeps the "which fields bind this query" decision in one
+// place. Kind is what makes a ranked token unusable as a due token.
+//
+// A cursor conveys position, not authority. Nothing here is trusted: the caller
+// compares Namespace, RankingScope, and DueBound against the LIVE request and
+// rejects a mismatch, so a forged token can only ask for a position the caller
+// was already entitled to read. That is also why these tokens are not signed —
+// a signature would protect a claim the decoder does not make, and a per-process
+// key would make one process's cursors unusable by another over the same stream.
+type orderedCursorPayload struct {
+	Kind          string `json:"k"`
+	Namespace     string `json:"ns"`
+	RankingScope  string `json:"rs,omitempty"`
+	Rank          int64  `json:"rank,omitempty"`
+	DueBound      int64  `json:"bound,omitempty"`
+	DueAt         int64  `json:"due,omitempty"`
+	StableKey     string `json:"sk"`
+	OrderingScope string `json:"os"`
+}
+
+// encodeOrderedCursor renders a position as an opaque, versioned token.
+func encodeOrderedCursor(payload orderedCursorPayload) (string, error) {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		// Unreachable by construction: every field is a string or an integer.
+		// It is still returned rather than discarded, because a silent encode
+		// failure would hand the caller a cursor that resumes somewhere else.
+		return "", &OrderedCodecError{Reason: "cursor encode failed", Cause: err}
+	}
+	return orderedCursorPrefix + strconv.Itoa(orderedCursorVersion) + "." +
+		base64.RawURLEncoding.EncodeToString(data), nil
+}
+
+// decodeOrderedCursorPayload parses an untrusted token for kind, classifying
+// every rejection under exactly one of the contract's four fail-closed rules.
+// The order of the gates is what makes the classification meaningful: the length
+// cap and the version prefix are checked before anything is decoded, the kind is
+// checked before the position is used, and the QUERY binding is left to the
+// caller, which is the only party holding the live request.
+func decodeOrderedCursorPayload(kind storage.OrderedCursorKind, token string) (orderedCursorPayload, error) {
+	reject := func(rule storage.OrderedCursorRule) error {
+		return storage.NewInvalidOrderedCursorError(kind, token, rule)
+	}
+	if len(token) > maxOrderedCursorBytes {
+		return orderedCursorPayload{}, reject(storage.OrderedCursorMalformed)
+	}
+	version, body, ok := splitOrderedCursorVersion(token)
+	if !ok {
+		return orderedCursorPayload{}, reject(storage.OrderedCursorMalformed)
+	}
+	if version != orderedCursorVersion {
+		return orderedCursorPayload{}, reject(storage.OrderedCursorUnknownVersion)
+	}
+	data, err := base64.RawURLEncoding.DecodeString(body)
+	if err != nil {
+		return orderedCursorPayload{}, reject(storage.OrderedCursorMalformed)
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	var payload orderedCursorPayload
+	if err := dec.Decode(&payload); err != nil {
+		return orderedCursorPayload{}, reject(storage.OrderedCursorMalformed)
+	}
+	if dec.More() {
+		return orderedCursorPayload{}, reject(storage.OrderedCursorMalformed)
+	}
+	if payload.Kind != string(kind) {
+		if payload.Kind == string(storage.RankedCursorKind) || payload.Kind == string(storage.DueCursorKind) {
+			return orderedCursorPayload{}, reject(storage.OrderedCursorWrongKind)
+		}
+		return orderedCursorPayload{}, reject(storage.OrderedCursorMalformed)
+	}
+	return payload, nil
+}
+
+// splitOrderedCursorVersion separates a token's plaintext version from its body.
+// It accepts only the canonical spelling this package emits — the prefix, at
+// least one decimal digit with no sign or padding, then the separator — so a
+// token that merely looks versioned is malformed rather than "some other
+// version".
+func splitOrderedCursorVersion(token string) (int, string, bool) {
+	rest, ok := strings.CutPrefix(token, orderedCursorPrefix)
+	if !ok {
+		return 0, "", false
+	}
+	digits, body, ok := strings.Cut(rest, ".")
+	if !ok || digits == "" {
+		return 0, "", false
+	}
+	version, err := strconv.Atoi(digits)
+	if err != nil || strconv.Itoa(version) != digits {
+		return 0, "", false
+	}
+	return version, body, true
+}
+
+// orderedMalformedCursorToken returns a nonempty token this package could never
+// have issued, for kind. It exists so F4.4 can satisfy
+// storetest.OrderedCursorProbe without a conformance test writing a literal in
+// this provider's grammar — the encoding is owned here, so the counterexamples
+// are owned here too.
+func orderedMalformedCursorToken(kind storage.OrderedCursorKind) string {
+	return "not-an-ordered-cursor-" + string(kind) + "-token"
+}
+
+// orderedUnknownVersionCursorToken returns a token that is well formed for this
+// encoding but carries a version this package does not support.
+func orderedUnknownVersionCursorToken(kind storage.OrderedCursorKind) string {
+	payload, err := json.Marshal(orderedCursorPayload{Kind: string(kind), Namespace: "sessions"})
+	if err != nil {
+		// Unreachable for the same reason as in encodeOrderedCursor; a fixed
+		// body still yields a well-formed unsupported-version token.
+		payload = []byte("{}")
+	}
+	return orderedCursorPrefix + strconv.Itoa(orderedCursorVersion+1) + "." +
+		base64.RawURLEncoding.EncodeToString(payload)
 }
