@@ -523,6 +523,22 @@ func TestOrderedListOrderedIncludesTombstonesRankedAndDueDoNot(t *testing.T) {
 	}
 }
 
+// TestOrderedListOrderedResumeAfterMaxUint64IsExhausted pins the exclusive
+// cursor's terminal value. Incrementing MaxUint64 would wrap to zero and
+// redeliver the entire scope.
+func TestOrderedListOrderedResumeAfterMaxUint64IsExhausted(t *testing.T) {
+	t.Parallel()
+	store, f := newViewTestStore(t)
+	ctx := viewCtx(t)
+	record := liveOrderedRecord(viewID("tenant/a", "last"), 1, math.MaxUint64)
+	seedOrderedRecord(t, f, record)
+
+	page := mustListOrdered(t, ctx, store, "tenant/a", math.MaxUint64, 10)
+	if len(page.Records) != 0 || page.NextAfterOrder != 0 {
+		t.Fatalf("ListOrdered(after MaxUint64) = %#v, want an exhausted page", page)
+	}
+}
+
 // TestOrderedNotDueMoveLeavesTheDueIndex proves a record that moves to not_due
 // is removed from the due index rather than merely filtered at read time.
 func TestOrderedNotDueMoveLeavesTheDueIndex(t *testing.T) {
@@ -640,6 +656,7 @@ func TestOrderedCursorsFailClosed(t *testing.T) {
 
 	mustViewCreate(t, ctx, store, viewID("tenant/a", "one"), "workers", ranked(2), dueAt(2))
 	mustViewCreate(t, ctx, store, viewID("tenant/a", "two"), "workers", ranked(1), dueAt(1))
+	mustViewCreate(t, ctx, store, viewID("tenant/a", "future"), "workers", ranked(0), dueAt(101))
 	rankedCursor := mustListRanked(t, ctx, store, "workers", "", 1).NextCursor
 	dueCursor := mustListDue(t, ctx, store, 100, "", 1).NextCursor
 	if rankedCursor == "" || dueCursor == "" {
@@ -687,6 +704,15 @@ func TestOrderedCursorsFailClosed(t *testing.T) {
 	}
 	t.Run("ListDue namespace mismatch", func(t *testing.T) {
 		page, err := store.ListDue(ctx, "other", 100, dueCursor, 10)
+		requireCursorRejection(t, "ListDue", storage.DueCursorKind, storage.OrderedCursorQueryMismatch, len(page.Records), err)
+	})
+	t.Run("ListDue resume tuple exceeds live bound", func(t *testing.T) {
+		// This is a valid provider token with bindings matching the live request,
+		// not a rewritten header. Its position could never have been issued by a
+		// page bounded at 100 because the tuple itself is due at 101.
+		body := base64.RawURLEncoding.EncodeToString([]byte(`{"k":"due","ns":"sessions","bound":100,"due":101,"sk":"two","os":"tenant/a"}`))
+		forged := storage.DueCursor("oi1." + body)
+		page, err := store.ListDue(ctx, viewTestNamespace, 100, forged, 10)
 		requireCursorRejection(t, "ListDue", storage.DueCursorKind, storage.OrderedCursorQueryMismatch, len(page.Records), err)
 	})
 }
@@ -792,6 +818,53 @@ func TestOrderedViewStopsOnClose(t *testing.T) {
 	}
 }
 
+// TestOrderedStoreCloseCancelsEveryViewBeforeWaiting proves a timed-out Close
+// cannot strand views that happen to follow the first slow view in the map.
+// Both goroutines deliberately wait behind allowExit after observing cancel, so
+// Close must cancel the complete set before any wait can finish.
+func TestOrderedStoreCloseCancelsEveryViewBeforeWaiting(t *testing.T) {
+	t.Parallel()
+	store := newOrderedStore(newFakeOrderedSeam())
+	allowExit := make(chan struct{})
+	views := make([]*orderedView, 0, 2)
+	for _, namespace := range []string{"sessions", "archive"} {
+		viewCtx, cancelView := context.WithCancel(context.Background())
+		view := &orderedView{namespace: namespace, cancel: cancelView, done: make(chan struct{})}
+		views = append(views, view)
+		store.views[namespace] = view
+		go func() {
+			<-viewCtx.Done()
+			<-allowExit
+			close(view.done)
+		}()
+	}
+	t.Cleanup(func() {
+		for _, view := range views {
+			view.cancel()
+		}
+	})
+
+	closeCtx, cancelClose := context.WithCancel(context.Background())
+	cancelClose()
+	err := store.Close(closeCtx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Close(expired context) = %T %v, want context.Canceled", err, err)
+	}
+	close(allowExit)
+	for _, view := range views {
+		select {
+		case <-view.done:
+		case <-time.After(time.Second):
+			t.Errorf("view %q was not cancelled by Close", view.namespace)
+		}
+	}
+	for _, namespace := range []string{"sessions", "archive"} {
+		if !strings.Contains(err.Error(), namespace) {
+			t.Errorf("Close error %q does not include failed view %q", err, namespace)
+		}
+	}
+}
+
 // TestOrderedViewFatalConfigurationFailsQueriesImmediately proves a namespace
 // whose stream cannot ever serve this layout reports that fact instead of
 // blocking every reader until their deadlines expire.
@@ -815,6 +888,35 @@ func TestOrderedViewFatalConfigurationFailsQueriesImmediately(t *testing.T) {
 	}
 	if starts := f.watchStartCount(); starts != 1 {
 		t.Errorf("watchStream was started %d times, want exactly 1: a permanently misconfigured stream must not be retried", starts)
+	}
+}
+
+// TestOrderedViewRebootsAfterRepairableConfigurationFatal proves a config
+// failure does not poison the process forever. An operator may repair stream
+// retention out of band; the next query must bootstrap a fresh subscription.
+func TestOrderedViewRebootsAfterRepairableConfigurationFatal(t *testing.T) {
+	t.Parallel()
+	store, f := newViewTestStore(t)
+	ctx := viewCtx(t)
+
+	fatal := &OrderedStreamConfigError{Stream: "OI_sessions", Reason: "max age is nonzero"}
+	f.mu.Lock()
+	f.watchErrs = []error{fatal}
+	f.mu.Unlock()
+	mustViewCreate(t, ctx, store, viewID("tenant/a", "one"), "workers", ranked(1), dueAt(1))
+
+	if _, err := store.ListDue(ctx, viewTestNamespace, 100, "", 10); !errors.As(err, new(*OrderedStreamConfigError)) {
+		t.Fatalf("ListDue(before repair) = %T %v, want *OrderedStreamConfigError", err, err)
+	}
+	page, err := store.ListDue(ctx, viewTestNamespace, 100, "", 10)
+	if err != nil {
+		t.Fatalf("ListDue(after repair): %v", err)
+	}
+	if got, want := viewLabels(page.Records), []string{"tenant/a/one"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("ListDue(after repair) = %v, want %v", got, want)
+	}
+	if starts := f.watchStartCount(); starts != 2 {
+		t.Errorf("watchStream was started %d times, want 2 (fatal view plus fresh view)", starts)
 	}
 }
 
@@ -918,6 +1020,12 @@ func TestOrderedViewRejectsCorruptRecordPayloads(t *testing.T) {
 	if _, err := store.ListDue(bounded, viewTestNamespace, 100, "", 10); !errors.As(err, new(*OrderedCodecError)) {
 		t.Fatalf("ListDue over a corrupt record subject = %T %v, want an *OrderedCodecError", err, err)
 	}
+	if _, err := store.ListDue(bounded, viewTestNamespace, 100, "", 10); !errors.As(err, new(*OrderedCodecError)) {
+		t.Fatalf("second ListDue over a corrupt record subject = %T %v, want the sticky *OrderedCodecError", err, err)
+	}
+	if starts := f.watchStartCount(); starts != 1 {
+		t.Errorf("corrupt payload started %d views, want 1: deterministic corruption remains sticky", starts)
+	}
 }
 
 // TestOrderedViewIgnoresCounterSubjects proves the per-scope order counters that
@@ -999,6 +1107,9 @@ func TestOrderedCursorRoundTripsAndRejectsTampering(t *testing.T) {
 		{name: "empty body", token: "oi1.", rule: storage.OrderedCursorMalformed},
 		{name: "no version prefix", token: base64.RawURLEncoding.EncodeToString([]byte("{}")), rule: storage.OrderedCursorMalformed},
 		{name: "non numeric version", token: "oix." + body, rule: storage.OrderedCursorMalformed},
+		{name: "zero-padded version", token: "oi01." + body, rule: storage.OrderedCursorMalformed},
+		{name: "multiply-padded version", token: "oi001." + body, rule: storage.OrderedCursorMalformed},
+		{name: "signed version", token: "oi+1." + body, rule: storage.OrderedCursorMalformed},
 		{name: "future version", token: "oi2." + body, rule: storage.OrderedCursorUnknownVersion},
 		{name: "zero version", token: "oi0." + body, rule: storage.OrderedCursorUnknownVersion},
 		{name: "not base64", token: "oi1.!!!!", rule: storage.OrderedCursorMalformed},

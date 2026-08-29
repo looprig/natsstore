@@ -1221,9 +1221,26 @@ func (s *orderedStore) readyView(ctx context.Context, namespace string) (*ordere
 		return nil, err
 	}
 	if err := view.waitBarrier(ctx, tip); err != nil {
+		s.evictRepairableFatal(namespace, view, err)
 		return nil, err
 	}
 	return view, nil
+}
+
+// evictRepairableFatal drops only a view whose stream configuration can be
+// repaired out of band. Corrupt record bytes remain sticky: rebuilding from
+// the same authoritative payload would deterministically fail again and should
+// not create an unbounded subscription loop.
+func (s *orderedStore) evictRepairableFatal(namespace string, view *orderedView, err error) {
+	var configErr *OrderedStreamConfigError
+	if !errors.As(err, &configErr) {
+		return
+	}
+	s.mu.Lock()
+	if s.views[namespace] == view {
+		delete(s.views, namespace)
+	}
+	s.mu.Unlock()
 }
 
 // queryStats reports the query-work counters. It exists for this module's own
@@ -1248,12 +1265,18 @@ func (s *orderedStore) Close(ctx context.Context) error {
 	clear(s.views)
 	s.mu.Unlock()
 
+	// Cancellation is a separate pass from waiting: an expired Close context
+	// must not let one slow view prevent every later view from being stopped.
+	for _, view := range views {
+		view.cancel()
+	}
+	errs := make([]error, 0, len(views))
 	for _, view := range views {
 		if err := view.stop(ctx); err != nil {
-			return err
+			errs = append(errs, err)
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // ListOrdered pages the immutable acceptance-order stream of one order scope,
@@ -1438,7 +1461,7 @@ func decodeDueCursor(cursor storage.DueCursor, namespace string, dueAtOrBefore i
 	if err != nil {
 		return storage.OrderedRecord{}, false, err
 	}
-	if payload.Namespace != namespace || payload.DueBound != dueAtOrBefore {
+	if payload.Namespace != namespace || payload.DueBound != dueAtOrBefore || payload.DueAt > dueAtOrBefore {
 		return storage.OrderedRecord{}, false, storage.NewInvalidOrderedCursorError(
 			storage.DueCursorKind, string(cursor), storage.OrderedCursorQueryMismatch)
 	}
