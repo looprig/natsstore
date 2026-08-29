@@ -57,13 +57,14 @@ data rather than failing.
 OrderedIndex creates publish a two-message atomic batch (scope counter plus record) and
 serialize same-scope creators within one process. Independent handles and processes still
 coordinate through JetStream subject-sequence preconditions and bounded jittered retries.
-The pinned NATS server limits in-flight atomic batches per stream to 50. The provider does
-not add a distributed admission coordinator: deployments capable of more than 50 processes
-simultaneously creating records in one namespace should shard namespaces or externally
-bound that concurrency. A server batch-cap rejection remains a definite typed batch error
-for the caller to retry; repeated subject-sequence races exhaust the provider's bounded
-retry budget as `*OrderedContentionError`. Neither case silently weakens atomicity or order
-guarantees.
+The pinned embedded NATS server's default limit is 50 in-flight atomic batches per stream.
+Remote operators may configure `MaxBatchInflightPerStream`, so their effective cap can
+differ. The provider does not add a distributed admission coordinator: deployments that
+can exceed their server's configured cap with simultaneous creates in one namespace should
+shard namespaces or externally bound that concurrency. A server batch-cap rejection
+remains a definite typed batch error for the caller to retry; repeated subject-sequence
+races exhaust the provider's bounded retry budget as `*OrderedContentionError`. Neither
+case silently weakens atomicity or order guarantees.
 
 ## Dependencies
 

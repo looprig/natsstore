@@ -43,7 +43,11 @@ func TestOpenEmbeddedReportsCanonicalStoragePath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	t.Cleanup(func() { _ = st.Close(ctx) })
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		_ = st.Close(cleanupCtx)
+	})
 
 	reporters := []struct {
 		name     string
@@ -85,7 +89,7 @@ func TestOpenEmbeddedReportsCanonicalStoragePath(t *testing.T) {
 
 // TestOpenEmbeddedRoundtrip is the public-entry-point end-to-end proof: Open on a PLAIN
 // t.TempDir() — deliberately NOT under $XDG_DATA_HOME and NOT under $HOME (we set no XDG
-// env) — stands up an owned embedded engine and wires all four primitives, each of which
+// env) — stands up an owned embedded engine and wires all five primitives, each of which
 // round-trips through the returned Store. This is the containment-lift proof: OpenEngine
 // would reject this dir (it escapes the home/XDG root), but Open's embedded mode uses the
 // caller-owned dir directly. It then proves Close is idempotent and that reopening the
@@ -120,7 +124,11 @@ func TestOpenEmbeddedRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open (reopen): %v", err)
 	}
-	t.Cleanup(func() { _ = st2.Close(ctx) })
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		_ = st2.Close(cleanupCtx)
+	})
 	tip, err := st2.Ledger.Tip(ctx, "sessions/main")
 	if err != nil {
 		t.Fatalf("reopen Ledger.Tip: %v", err)
@@ -135,6 +143,60 @@ func TestOpenEmbeddedRoundtrip(t *testing.T) {
 	}
 	if reopened.Order == 0 || string(reopened.Value) != "ordered-value" {
 		t.Errorf("reopened ordered record = {Order:%d Value:%q}, want nonzero order and %q", reopened.Order, reopened.Value, "ordered-value")
+	}
+}
+
+func TestRemoteWireStoreRetainsOrderedLifecycle(t *testing.T) {
+	eng, err := openEngineAt(t.TempDir(), 0, maxPayload)
+	if err != nil {
+		t.Fatalf("open engine: %v", err)
+	}
+	t.Cleanup(func() { _ = eng.Close() })
+	conn, err := nats.Connect("", nats.InProcessServer(eng.srv), nats.Name("natsstore-remote-wire-test"))
+	if err != nil {
+		t.Fatalf("connect independent client: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	// This is openRemote's complete post-connect path over an independent NATS
+	// client, without requiring a separately managed external server.
+	st, err := wireStore(ctx, conn, newLocalPathReporter(), conn.Drain)
+	if err != nil {
+		conn.Close()
+		t.Fatalf("wireStore(remote connection): %v", err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		_ = st.Close(cleanupCtx)
+	})
+	if st.ordered == nil || st.OrderedIndex != st.ordered {
+		t.Fatal("remote wire path did not retain the Composite's ordered lifecycle owner")
+	}
+	if paths := st.StoragePaths(); len(paths) != 0 {
+		t.Fatalf("remote StoragePaths = %v, want none", paths)
+	}
+	if _, err := st.OrderedIndex.ListDue(ctx, "remote-empty", 100, "", 1); err != nil {
+		t.Fatalf("ListDue(remote unwritten namespace): %v", err)
+	}
+	st.ordered.mu.Lock()
+	view := st.ordered.views["remote-empty"]
+	st.ordered.mu.Unlock()
+	if view == nil {
+		t.Fatal("remote query did not retain its namespace view")
+	}
+	if err := st.Close(ctx); err != nil {
+		t.Fatalf("Close(remote): %v", err)
+	}
+	select {
+	case <-view.done:
+	default:
+		t.Error("remote ordered view outlived Store.Close")
+	}
+	// Store owns only the independent connection; its backing engine remains live.
+	if !eng.Conn().IsConnected() {
+		t.Error("closing the remote-shaped Store closed the backing engine connection")
 	}
 }
 
@@ -184,8 +246,10 @@ func TestOrderedIndexMultiHandleConcurrentOrder(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	t.Cleanup(func() {
-		_ = left.Close(context.Background())
-		_ = right.Close(context.Background())
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		_ = left.Close(cleanupCtx)
+		_ = right.Close(cleanupCtx)
 		rightConn.Close()
 		_ = eng.Close()
 	})
@@ -241,28 +305,38 @@ func TestOrderedIndexMultiHandleConcurrentOrder(t *testing.T) {
 	}
 }
 
-// TestStoreCloseStopsOrderedView proves the public Store lifecycle owns the
+// TestStoreCloseStopsOrderedView proves a Store returned by public Open owns its
 // derived OrderedIndex views: Close cancels their subscriptions, waits for each
 // done signal, refuses later queries, and remains idempotent.
 func TestStoreCloseStopsOrderedView(t *testing.T) {
-	fake := newFakeOrderedSeam()
-	ordered := newOrderedStore(fake)
-	ordered.retryBase = 0
-	ordered.viewRetryBase = time.Millisecond
-	st := &Store{Composite: &storage.Composite{OrderedIndex: ordered}, ordered: ordered}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	st, err := Open(ctx, Options{EmbeddedDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		if err := st.Close(cleanupCtx); err != nil {
+			t.Errorf("cleanup Close: %v", err)
+		}
+	})
+	if st.ordered == nil {
+		t.Fatal("Open did not retain the ordered lifecycle owner")
+	}
+	ordered := st.ordered
 
 	id := storage.OrderedID{Namespace: "sessions", OrderingScope: "acceptance", StableKey: "one"}
-	if _, created, err := ordered.Create(ctx, id, "workers", []byte("value"), storage.Rank{}, storage.Due{State: storage.NotDue}); err != nil || !created {
+	if _, created, err := st.OrderedIndex.Create(ctx, id, "workers", []byte("value"), storage.Rank{}, storage.Due{State: storage.NotDue}); err != nil || !created {
 		t.Fatalf("Create = created %v, err %v", created, err)
 	}
-	if _, err := ordered.ListDue(ctx, "sessions", 100, "", 1); err != nil {
+	if _, err := st.OrderedIndex.ListDue(ctx, "sessions", 100, "", 1); err != nil {
 		t.Fatalf("ListDue: %v", err)
 	}
 	// A read of an unwritten namespace starts the same retrying subscription
 	// lifecycle even though its stream has not been provisioned yet.
-	if page, err := ordered.ListDue(ctx, "empty", 100, "", 1); err != nil || len(page.Records) != 0 {
+	if page, err := st.OrderedIndex.ListDue(ctx, "empty", 100, "", 1); err != nil || len(page.Records) != 0 {
 		t.Fatalf("ListDue(unwritten namespace) = records %d, err %v; want empty page, nil", len(page.Records), err)
 	}
 	ordered.mu.Lock()
@@ -271,15 +345,12 @@ func TestStoreCloseStopsOrderedView(t *testing.T) {
 		views = append(views, view)
 	}
 	ordered.mu.Unlock()
-	if got := fake.watcherCount(); got != 2 || len(views) != 2 {
-		t.Fatalf("before Close: watchers=%d views=%d, want 2 and 2", got, len(views))
+	if len(views) != 2 {
+		t.Fatalf("before Close: views=%d, want 2", len(views))
 	}
 
 	if err := st.Close(ctx); err != nil {
 		t.Fatalf("Close: %v", err)
-	}
-	if got := fake.watcherCount(); got != 0 {
-		t.Errorf("watchers after Close = %d, want 0", got)
 	}
 	for _, view := range views {
 		select {

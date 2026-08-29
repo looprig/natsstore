@@ -5,6 +5,9 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/looprig/storage"
 )
 
 // TestOptionsResolve covers the server-free validation half of Open: exactly one of
@@ -186,6 +189,58 @@ func TestStoreCloseIdempotent(t *testing.T) {
 	if !s.closed {
 		t.Error("closed flag not set after Close")
 	}
+}
+
+func TestStoreCloseOrdersAndJoinsLifecycleErrors(t *testing.T) {
+	t.Run("ordered views stop before backend", func(t *testing.T) {
+		ordered := newOrderedStore(newFakeOrderedSeam())
+		viewCtx, cancelView := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() {
+			<-viewCtx.Done()
+			close(done)
+		}()
+		ordered.views["sessions"] = &orderedView{namespace: "sessions", cancel: cancelView, done: done}
+
+		backendErr := errors.New("backend close failed")
+		backendCalls := 0
+		st := newStore(&storage.Composite{OrderedIndex: ordered}, newLocalPathReporter(), ordered, func() error {
+			backendCalls++
+			select {
+			case <-done:
+			default:
+				t.Error("backend close ran before the ordered view stopped")
+			}
+			return backendErr
+		})
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := st.Close(ctx); !errors.Is(err, backendErr) {
+			t.Fatalf("Close = %v, want backend error", err)
+		}
+		if err := st.Close(ctx); err != nil {
+			t.Fatalf("second Close = %v, want nil", err)
+		}
+		if backendCalls != 1 {
+			t.Errorf("backend close calls = %d, want 1", backendCalls)
+		}
+	})
+
+	t.Run("ordered and backend errors are joined", func(t *testing.T) {
+		ordered := newOrderedStore(newFakeOrderedSeam())
+		ordered.views["stuck"] = &orderedView{namespace: "stuck", cancel: func() {}, done: make(chan struct{})}
+		backendErr := errors.New("backend close failed")
+		st := newStore(&storage.Composite{OrderedIndex: ordered}, newLocalPathReporter(), ordered, func() error { return backendErr })
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		err := st.Close(ctx)
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("Close error = %v, want joined context.Canceled", err)
+		}
+		if !errors.Is(err, backendErr) {
+			t.Errorf("Close error = %v, want joined backend error", err)
+		}
+	})
 }
 
 // TestRedactURL proves a NATS URL's userinfo password never survives into a *ConnectError:

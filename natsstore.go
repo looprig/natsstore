@@ -200,11 +200,10 @@ type Store struct {
 	pathReporter localPathReporter
 	ordered      *orderedStore
 
-	// engine is the owned embedded engine (embedded mode); conn is the owned remote
-	// connection (remote mode). Exactly one is non-nil, decided at Open, and it is what
-	// Close tears down.
-	engine *Engine
-	conn   *nats.Conn
+	// closeBackend drains and closes the backend selected by Open. It is retained as
+	// a function because embedded Engine.Close and remote nats.Conn.Drain have
+	// different method names but identical Store lifecycle placement.
+	closeBackend func() error
 
 	mu     sync.Mutex
 	closed bool
@@ -259,12 +258,12 @@ func openEmbedded(ctx context.Context, res resolvedOptions) (*Store, error) {
 		return nil, err
 	}
 	reporter := newLocalPathReporter(canonical)
-	comp, err := buildComposite(ctx, eng.Conn(), reporter)
+	st, err := wireStore(ctx, eng.Conn(), reporter, eng.Close)
 	if err != nil {
 		_ = eng.Close()
 		return nil, err
 	}
-	return &Store{Composite: comp, pathReporter: reporter, ordered: comp.OrderedIndex.(*orderedStore), engine: eng}, nil
+	return st, nil
 }
 
 // openRemote dials the remote URL with explicit, secure defaults (no InsecureSkipVerify;
@@ -281,12 +280,33 @@ func openRemote(ctx context.Context, res resolvedOptions) (*Store, error) {
 		return nil, &ConnectError{URL: redactURL(res.url), Cause: err}
 	}
 	reporter := newLocalPathReporter()
-	comp, err := buildComposite(ctx, conn, reporter)
+	st, err := wireStore(ctx, conn, reporter, conn.Drain)
 	if err != nil {
 		conn.Close()
 		return nil, err
 	}
-	return &Store{Composite: comp, pathReporter: reporter, ordered: comp.OrderedIndex.(*orderedStore), conn: conn}, nil
+	return st, nil
+}
+
+// wireStore is the shared embedded/remote composition boundary. Keeping the
+// OrderedIndex lifecycle binding here means both modes retain the exact provider
+// instance placed in the public Composite; only their backend close function differs.
+func wireStore(ctx context.Context, conn *nats.Conn, reporter localPathReporter, closeBackend func() error) (*Store, error) {
+	comp, err := buildComposite(ctx, conn, reporter)
+	if err != nil {
+		return nil, err
+	}
+	ordered, ok := comp.OrderedIndex.(*orderedStore)
+	if !ok {
+		return nil, &WiringError{Component: "ordered-index", Cause: errors.New("natsstore: composite ordered index has unexpected implementation")}
+	}
+	return newStore(comp, reporter, ordered, closeBackend), nil
+}
+
+// newStore retains the public composite and its lifecycle owners. It is split
+// from wireStore as the narrow shutdown-order/error-aggregation test seam.
+func newStore(comp *storage.Composite, reporter localPathReporter, ordered *orderedStore, closeBackend func() error) *Store {
+	return &Store{Composite: comp, pathReporter: reporter, ordered: ordered, closeBackend: closeBackend}
 }
 
 // backingBuckets are the three provisioned JetStream buckets a Store's leaser, KV, and
@@ -380,11 +400,8 @@ func (s *Store) Close(ctx context.Context) error {
 		orderedErr = s.ordered.Close(ctx)
 	}
 	var backendErr error
-	switch {
-	case s.engine != nil:
-		backendErr = s.engine.Close()
-	case s.conn != nil:
-		backendErr = s.conn.Drain()
+	if s.closeBackend != nil {
+		backendErr = s.closeBackend()
 	}
 	return errors.Join(orderedErr, backendErr)
 }
