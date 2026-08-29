@@ -867,3 +867,83 @@ func TestOrderedValuesAreCallerOwned(t *testing.T) {
 		t.Fatalf("reads share a backing array: %q", other.Value)
 	}
 }
+
+// deletedOrderedRecord is the canonical tombstone the contract requires Update
+// and Delete to report regardless of expectedRevision.
+func deletedOrderedRecord(id storage.OrderedID, revision, order uint64) storage.OrderedRecord {
+	rec := liveOrderedRecord(id, revision, order)
+	rec.Deleted = true
+	rec.Rank = storage.Rank{}
+	rec.Due = storage.Due{State: storage.NotDue}
+	return rec
+}
+
+// TestOrderedLostCASAgainstConcurrentDelete pins the contract on the ONE path
+// that reads the record back after losing its compare-and-swap. The contract
+// says an absent record and a tombstone outrank the revision compare in both
+// Update and Delete, "regardless of expectedRevision". The pre-write reads
+// already honour that; the post-loss read must too, because the only
+// linearization of a lost fence is AFTER the write that won it.
+func TestOrderedLostCASAgainstConcurrentDelete(t *testing.T) {
+	t.Parallel()
+	id := orderedTestID()
+
+	// tombstoneOnPublish makes the first publish lose its fence to a concurrent
+	// Delete that has already tombstoned the record.
+	tombstoneOnPublish := func(tomb storage.OrderedRecord) func(*fakeOrderedSeam, []orderedMsg) error {
+		return func(f *fakeOrderedSeam, msgs []orderedMsg) error {
+			f.hook = nil
+			data, err := encodeOrderedRecord(tomb)
+			if err != nil {
+				return err
+			}
+			f.setLocked(msgs[0].subject, data)
+			return nil
+		}
+	}
+
+	t.Run("update reports the tombstone", func(t *testing.T) {
+		t.Parallel()
+		f := newFakeOrderedSeam()
+		store := newOrderedStore(f)
+		seedOrderedRecord(t, f, liveOrderedRecord(id, 3, 11))
+		f.hook = tombstoneOnPublish(deletedOrderedRecord(id, 4, 11))
+		_, err := store.Update(context.Background(), id, 3, []byte("mine"), storage.Rank{}, storage.Due{})
+		var deleted *storage.OrderedDeletedError
+		if !errors.As(err, &deleted) {
+			t.Fatalf("error = %v (%T), want *storage.OrderedDeletedError", err, err)
+		}
+		if deleted.ID != id {
+			t.Fatalf("deleted.ID = %+v, want %+v", deleted.ID, id)
+		}
+	})
+
+	t.Run("delete reports the tombstone", func(t *testing.T) {
+		t.Parallel()
+		f := newFakeOrderedSeam()
+		store := newOrderedStore(f)
+		seedOrderedRecord(t, f, liveOrderedRecord(id, 3, 11))
+		tomb := deletedOrderedRecord(id, 4, 11)
+		f.hook = tombstoneOnPublish(tomb)
+		got, err := store.Delete(context.Background(), id, 3)
+		if err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+		if !got.Deleted || got.Revision != tomb.Revision {
+			t.Fatalf("Delete returned %+v, want the canonical tombstone %+v", got, tomb)
+		}
+	})
+
+	t.Run("update still conflicts against a live winner", func(t *testing.T) {
+		t.Parallel()
+		f := newFakeOrderedSeam()
+		store := newOrderedStore(f)
+		seedOrderedRecord(t, f, liveOrderedRecord(id, 3, 11))
+		f.hook = tombstoneOnPublish(liveOrderedRecord(id, 4, 11))
+		_, err := store.Update(context.Background(), id, 3, []byte("mine"), storage.Rank{}, storage.Due{})
+		var conflict *storage.OrderedRevisionConflictError
+		if !errors.As(err, &conflict) {
+			t.Fatalf("error = %v (%T), want *storage.OrderedRevisionConflictError", err, err)
+		}
+	})
+}

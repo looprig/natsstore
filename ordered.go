@@ -379,6 +379,17 @@ func (s *orderedStore) commitRevision(ctx context.Context, stream, subject strin
 		if !ok {
 			return storage.OrderedRecord{}, &storage.OrderedRecordNotFoundError{ID: next.ID}
 		}
+		// The fence lost, so the only linearization of this call is AFTER the write
+		// that won it. If that winner was a Delete, the contract's precedence
+		// applies unchanged: Update reports the tombstone, Delete returns it, and
+		// neither is a revision conflict — "regardless of expectedRevision" governs
+		// this read exactly as it governs the pre-write one.
+		if current.Deleted {
+			if op == storage.OrderedDeleteOperation {
+				return current, nil
+			}
+			return storage.OrderedRecord{}, &storage.OrderedDeletedError{ID: next.ID}
+		}
 		return storage.OrderedRecord{}, &storage.OrderedRevisionConflictError{
 			ID: next.ID, ExpectedRevision: expectedRevision, ActualRevision: current.Revision,
 		}
