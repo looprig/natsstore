@@ -2,6 +2,7 @@ package natsstore
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"strconv"
@@ -36,6 +37,22 @@ const (
 	orderedHdrBatchSeq    = "Nats-Batch-Sequence"
 	orderedHdrBatchCommit = "Nats-Batch-Commit"
 )
+
+// orderedBatchNonceBytes is the amount of crypto/rand entropy each seam mixes
+// into its batch ids. The server keys in-flight atomic-batch state by batch id
+// WITHIN THE STREAM and records no client identity, so two writers that emit the
+// same id abort each other's staged messages — and an interleaving that happens
+// to satisfy the server's batch-sequence gap check commits one writer's message
+// together with another's as a single "atomic" batch. A per-seam counter alone
+// cannot prevent that: it restarts at 1 in every seam and every process. 128
+// bits of per-seam entropy makes a collision between seams not worth reasoning
+// about, and the counter keeps ids distinct within a seam.
+const orderedBatchNonceBytes = 16
+
+// orderedMaxBatchIDLen is the server's ceiling on a batch id
+// (nats-server/v2 server/stream.go). orderedBatchID stays under it by
+// construction; orderedBatchIDPrefix is deliberately terse to leave room.
+const orderedMaxBatchIDLen = 64
 
 // OrderedStreamOpError reports a definite failure of a stream-management
 // operation the ordered seam performs (lookup, create, info, or a batch member
@@ -109,7 +126,10 @@ type jetStreamOrderedSeam struct {
 	nc *nats.Conn
 	js jetstream.JetStream
 
-	batchID atomic.Uint64
+	// batchNonce is this seam's process-and-instance-unique batch-id prefix, and
+	// batchID keeps ids distinct within the seam. See orderedBatchNonceBytes.
+	batchNonce string
+	batchID    atomic.Uint64
 
 	mu      sync.RWMutex
 	streams map[string]jetstream.Stream
@@ -121,7 +141,32 @@ var _ orderedSeam = (*jetStreamOrderedSeam)(nil)
 // production ordered seam. The new jetstream package is required, not optional:
 // the legacy nats.JetStreamContext cannot create an AllowAtomicPublish stream.
 func newJetStreamOrderedSeam(nc *nats.Conn, js jetstream.JetStream) *jetStreamOrderedSeam {
-	return &jetStreamOrderedSeam{nc: nc, js: js, streams: map[string]jetstream.Stream{}}
+	return &jetStreamOrderedSeam{
+		nc:         nc,
+		js:         js,
+		batchNonce: newOrderedBatchNonce(),
+		streams:    map[string]jetstream.Stream{},
+	}
+}
+
+// orderedBatchIDPrefix marks this package's batch ids in server logs. It is kept
+// short because the id must fit orderedMaxBatchIDLen alongside the nonce and the
+// counter.
+const orderedBatchIDPrefix = "ns-"
+
+// newOrderedBatchNonce draws this seam's batch-id entropy. The standard library
+// supplies everything a globally unique prefix needs, so no third-party id
+// package (nuid, uuid) is added to this module's direct dependencies for it.
+func newOrderedBatchNonce() string {
+	var nonce [orderedBatchNonceBytes]byte
+	orderedRandomBytes(nonce[:])
+	return hex.EncodeToString(nonce[:])
+}
+
+// nextBatchID returns an id no other seam, in this process or any other, will
+// emit.
+func (s *jetStreamOrderedSeam) nextBatchID() string {
+	return orderedBatchIDPrefix + s.batchNonce + "-" + strconv.FormatUint(s.batchID.Add(1), 10)
 }
 
 // orderedStreamConfig is the configuration every ordered namespace stream must
@@ -304,7 +349,7 @@ func (s *jetStreamOrderedSeam) publishBatch(ctx context.Context, msgs []orderedM
 	if len(msgs) == 0 {
 		return &OrderedBatchRejectedError{Description: "batch has no messages"}
 	}
-	id := "natsstore-" + strconv.FormatUint(s.batchID.Add(1), 10)
+	id := s.nextBatchID()
 	for i, m := range msgs {
 		msg := nats.NewMsg(m.subject)
 		msg.Data = m.data

@@ -7,8 +7,11 @@ import (
 	"errors"
 	"math"
 	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/looprig/storage"
 )
@@ -946,4 +949,146 @@ func TestOrderedLostCASAgainstConcurrentDelete(t *testing.T) {
 			t.Fatalf("error = %v (%T), want *storage.OrderedRevisionConflictError", err, err)
 		}
 	})
+}
+
+// TestOrderedCreateContention pins the bounded retry budget. It is the only test
+// that constructs an *OrderedContentionError, and it proves the store gives up
+// with a typed, retryable error rather than spinning forever.
+func TestOrderedCreateContention(t *testing.T) {
+	t.Parallel()
+	f := newFakeOrderedSeam()
+	store := newOrderedStore(f)
+	store.retryBase = 0
+	id := orderedTestID()
+	counterSubj, _ := orderedSubjects(t, id)
+	// A concurrent allocator wins the counter on EVERY attempt, so no attempt can
+	// ever commit and the record subject stays absent.
+	f.hook = func(f *fakeOrderedSeam, _ []orderedMsg) error {
+		last, err := decodeOrderedCounter(f.msgs[counterSubj].data)
+		if err != nil && f.msgs[counterSubj].seq != 0 {
+			return err
+		}
+		f.setLocked(counterSubj, encodeOrderedCounter(last+1))
+		return nil
+	}
+	_, created, err := store.Create(context.Background(), id, "catalog", []byte("v"), storage.Rank{}, storage.Due{})
+	if created {
+		t.Fatal("created=true although every attempt lost the counter race")
+	}
+	var contention *OrderedContentionError
+	if !errors.As(err, &contention) {
+		t.Fatalf("error = %v (%T), want *OrderedContentionError", err, err)
+	}
+	if contention.Attempts != orderedCreateAttempts || contention.ID != id {
+		t.Fatalf("contention = %+v, want %d attempts for %+v", contention, orderedCreateAttempts, id)
+	}
+	if msg := contention.Error(); !strings.Contains(msg, strconv.Itoa(orderedCreateAttempts)) ||
+		!strings.Contains(msg, id.OrderingScope) {
+		t.Fatalf("Error() = %q, want the scope and the attempt count", msg)
+	}
+	if n := f.publishCount(); n != orderedCreateAttempts {
+		t.Fatalf("Create attempted %d batches, want %d", n, orderedCreateAttempts)
+	}
+}
+
+// TestOrderedWaitBeforeRetry pins the backoff's three obligations: it is
+// disableable (tests drive the retry budget without paying for waits), it stays
+// inside its exponential window so the bounded loop stays bounded, and it honours
+// the caller's context rather than blocking past a cancellation.
+func TestOrderedWaitBeforeRetry(t *testing.T) {
+	t.Parallel()
+
+	t.Run("disabled", func(t *testing.T) {
+		t.Parallel()
+		store := newOrderedStore(newFakeOrderedSeam())
+		store.retryBase = 0
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		// With no base there is nothing to wait for, so not even a cancelled
+		// context can turn the call into a failure.
+		if err := store.waitBeforeRetry(ctx, 1); err != nil {
+			t.Fatalf("waitBeforeRetry with no base: %v", err)
+		}
+	})
+
+	t.Run("stays inside its window", func(t *testing.T) {
+		t.Parallel()
+		store := newOrderedStore(newFakeOrderedSeam())
+		store.retryBase = time.Millisecond
+		for attempt := 1; attempt <= orderedRetryMaxShift+3; attempt++ {
+			window := store.retryBase << min(attempt-1, orderedRetryMaxShift)
+			began := time.Now()
+			if err := store.waitBeforeRetry(context.Background(), attempt); err != nil {
+				t.Fatalf("waitBeforeRetry(%d): %v", attempt, err)
+			}
+			// Timer granularity is generous, so only the exponential's cap is
+			// asserted: the window must stop doubling at orderedRetryMaxShift.
+			if elapsed := time.Since(began); elapsed > window+time.Second {
+				t.Fatalf("attempt %d waited %s, past its %s window", attempt, elapsed, window)
+			}
+		}
+	})
+
+	t.Run("honours cancellation", func(t *testing.T) {
+		t.Parallel()
+		store := newOrderedStore(newFakeOrderedSeam())
+		store.retryBase = time.Hour
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if err := store.waitBeforeRetry(ctx, orderedRetryMaxShift); !errors.Is(err, context.Canceled) {
+			t.Fatalf("error = %v, want context.Canceled", err)
+		}
+	})
+}
+
+// TestOrderedCreateHonoursContextWhileQueued proves the per-scope latch never
+// blocks a caller past its context: a creator waiting behind another creator in
+// the same scope gives up when its own context does.
+func TestOrderedCreateHonoursContextWhileQueued(t *testing.T) {
+	t.Parallel()
+	f := newFakeOrderedSeam()
+	store := newOrderedStore(f)
+	id := orderedTestID()
+	counterSubj, _ := orderedSubjects(t, id)
+
+	release, err := store.acquireScope(context.Background(), counterSubj)
+	if err != nil {
+		t.Fatalf("acquireScope: %v", err)
+	}
+	defer release()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	other := storage.OrderedID{Namespace: id.Namespace, OrderingScope: id.OrderingScope, StableKey: "queued"}
+	_, created, err := store.Create(ctx, other, "catalog", nil, storage.Rank{}, storage.Due{})
+	if created || !errors.Is(err, context.Canceled) {
+		t.Fatalf("Create = (created=%v, %v), want context.Canceled", created, err)
+	}
+	if n := f.publishCount(); n != 0 {
+		t.Fatalf("Create published %d times while queued, want 0", n)
+	}
+}
+
+// TestOrderedScopeLatchIsReleased proves the latch map does not grow one entry
+// per order scope ever written: a scope that goes idle is dropped.
+func TestOrderedScopeLatchIsReleased(t *testing.T) {
+	t.Parallel()
+	store := newOrderedStore(newFakeOrderedSeam())
+	release, err := store.acquireScope(context.Background(), "oi.sessions.c.tenant")
+	if err != nil {
+		t.Fatalf("acquireScope: %v", err)
+	}
+	store.mu.Lock()
+	held := len(store.latches)
+	store.mu.Unlock()
+	if held != 1 {
+		t.Fatalf("held latches = %d, want 1", held)
+	}
+	release()
+	store.mu.Lock()
+	idle := len(store.latches)
+	store.mu.Unlock()
+	if idle != 0 {
+		t.Fatalf("idle latches = %d, want the scope dropped", idle)
+	}
 }

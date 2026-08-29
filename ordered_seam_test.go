@@ -3,7 +3,9 @@ package natsstore
 import (
 	"context"
 	"errors"
+	"math"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -175,11 +177,45 @@ func TestJetStreamOrderedSeamStreamCache(t *testing.T) {
 	if err := seam.ensureStream(context.Background(), orderedStreamSpec{stream: "OI_present"}); err != nil {
 		t.Fatalf("ensureStream on a cached stream: %v", err)
 	}
-	// Batch id generation is monotonic, which is what keeps two concurrent
-	// batches on one connection from sharing an id.
-	first := seam.batchID.Add(1)
-	if second := seam.batchID.Add(1); second <= first {
-		t.Fatalf("batch ids are not monotonic: %d then %d", first, second)
+}
+
+// TestJetStreamOrderedSeamBatchIDsAreGloballyUnique pins the property the
+// server's batch bookkeeping depends on. The server keys in-flight atomic-batch
+// state by batch id WITHIN THE STREAM and records no client identity, so two
+// seams — in one process or two — that emit the same id abort each other's
+// staged messages, and an interleaving that satisfies the server's batch-sequence
+// gap check commits one seam's message together with the other's. A per-seam
+// counter alone cannot prevent that: it restarts at 1 everywhere.
+func TestJetStreamOrderedSeamBatchIDsAreGloballyUnique(t *testing.T) {
+	t.Parallel()
+
+	const seams, perSeam = 8, 64
+	ids := map[string]struct{}{}
+	for range seams {
+		seam := newJetStreamOrderedSeam(nil, nil)
+		for range perSeam {
+			id := seam.nextBatchID()
+			if _, dup := ids[id]; dup {
+				t.Fatalf("two seams emitted the batch id %q", id)
+			}
+			// The server refuses a longer id outright.
+			if len(id) > orderedMaxBatchIDLen {
+				t.Fatalf("batch id %q is %d bytes, over the server's %d byte ceiling", id, len(id), orderedMaxBatchIDLen)
+			}
+			if !strings.HasPrefix(id, orderedBatchIDPrefix) {
+				t.Fatalf("batch id %q does not carry the %q marker", id, orderedBatchIDPrefix)
+			}
+			ids[id] = struct{}{}
+		}
+	}
+	if len(ids) != seams*perSeam {
+		t.Fatalf("got %d distinct ids from %d seams, want %d", len(ids), seams, seams*perSeam)
+	}
+	// The longest id this seam can ever emit must still fit.
+	seam := newJetStreamOrderedSeam(nil, nil)
+	seam.batchID.Store(math.MaxUint64 - 1)
+	if id := seam.nextBatchID(); len(id) > orderedMaxBatchIDLen {
+		t.Fatalf("the widest batch id %q is %d bytes, over the %d byte ceiling", id, len(id), orderedMaxBatchIDLen)
 	}
 }
 

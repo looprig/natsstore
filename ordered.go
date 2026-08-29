@@ -3,19 +3,36 @@ package natsstore
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"math"
 	"strconv"
+	"sync"
+	"time"
 
 	"github.com/looprig/storage"
 )
 
 // orderedCreateAttempts bounds the optimistic retry loop Create runs when it
-// loses the per-scope counter race. Each attempt costs one head read and one
-// rejected batch, and every rejection means some other writer made progress, so
-// the loop is livelock-free; the bound exists only so a pathologically contended
-// scope fails loudly instead of spinning forever.
+// loses the per-scope counter race. Every rejection means SOME writer made
+// progress, so the scope as a whole never livelocks — but that says nothing
+// about THIS caller, which can lose to newly arriving writers indefinitely. The
+// bound is therefore a real last resort, not a formality: exhausting it yields a
+// retryable *OrderedContentionError. Two mechanisms keep it out of reach in
+// practice — the per-scope latch (orderedStore.acquireScope), which stops
+// same-process creators from colliding at all, and the jittered backoff below,
+// which breaks the lockstep herd across processes.
 const orderedCreateAttempts = 64
+
+// The retry backoff. Losers that retry with no delay re-collide immediately, so
+// each round costs O(N) round trips and N rounds cost O(N^2); a jittered wait
+// spreads the herd instead. The base is small enough to be invisible at low
+// contention and the cap keeps the worst case bounded.
+const (
+	orderedRetryBase     = 100 * time.Microsecond
+	orderedRetryMaxShift = 8 // cap the window at orderedRetryBase << 8
+)
 
 // The seam reports exactly two conditions the ordered store must distinguish
 // from an ordinary failure, and it reports them as leaf sentinels so the store's
@@ -32,7 +49,9 @@ var (
 )
 
 // OrderedContentionError reports a Create that could not win its order scope's
-// counter within the bounded retry budget.
+// counter within the bounded retry budget. Nothing was written, and the identity
+// is still free, so the operation is RETRYABLE: a caller that retries it later
+// gets a normal allocation once the scope quiets down.
 type OrderedContentionError struct {
 	ID       storage.OrderedID
 	Attempts int
@@ -109,12 +128,103 @@ type orderedSeam interface {
 // concurrent use as the seam beneath it.
 type orderedStore struct {
 	seam orderedSeam
+
+	// retryBase is the backoff window Create starts from. It is a field rather
+	// than a constant only so tests can drive the retry budget to exhaustion
+	// without paying for the waits; production always uses orderedRetryBase.
+	retryBase time.Duration
+
+	// mu guards latches, the per-order-scope in-process queue. See acquireScope.
+	mu      sync.Mutex
+	latches map[string]*orderedScopeLatch
+
+	// localPathReporter carries the engine's on-disk paths. It is populated when
+	// the store is wired into the composite (see buildComposite in natsstore.go),
+	// which is the lifecycle task; an unwired store reports no paths.
 	localPathReporter
 }
 
 // newOrderedStore builds an ordered index over seam.
 func newOrderedStore(seam orderedSeam) *orderedStore {
-	return &orderedStore{seam: seam}
+	return &orderedStore{
+		seam:      seam,
+		retryBase: orderedRetryBase,
+		latches:   map[string]*orderedScopeLatch{},
+	}
+}
+
+// orderedScopeLatch serializes this process's creators within one order scope.
+// token holds a single permit; refs is how many callers currently want the
+// latch, so it can be dropped from the map when the scope goes idle instead of
+// accumulating one entry per scope ever written.
+type orderedScopeLatch struct {
+	token chan struct{}
+	refs  int
+}
+
+// acquireScope makes same-process Creates in one order scope queue instead of
+// colliding. Nothing is lost by doing so: the counter fence already admits
+// exactly one allocator at a time, so concurrent attempts within a process were
+// never parallelism — only wasted round trips, wasted server-side in-flight
+// batch slots, and a herd that re-collides on every retry. Cross-process
+// contention is still handled optimistically, by the fence and the backoff.
+//
+// It returns a release function that must be called exactly once, and honours
+// ctx while waiting.
+func (s *orderedStore) acquireScope(ctx context.Context, key string) (func(), error) {
+	s.mu.Lock()
+	latch, ok := s.latches[key]
+	if !ok {
+		latch = &orderedScopeLatch{token: make(chan struct{}, 1)}
+		s.latches[key] = latch
+	}
+	latch.refs++
+	s.mu.Unlock()
+
+	drop := func(held bool) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if held {
+			<-latch.token
+		}
+		latch.refs--
+		if latch.refs == 0 {
+			delete(s.latches, key)
+		}
+	}
+
+	select {
+	case latch.token <- struct{}{}:
+		return func() { drop(true) }, nil
+	case <-ctx.Done():
+		drop(false)
+		return nil, ctx.Err()
+	}
+}
+
+// waitBeforeRetry sleeps a uniformly random slice of an exponentially growing
+// window ("full jitter"), or returns ctx's error if the caller gives up first.
+// The randomness is what breaks the herd, so it is drawn per caller per attempt.
+func (s *orderedStore) waitBeforeRetry(ctx context.Context, attempt int) error {
+	if s.retryBase <= 0 {
+		return nil
+	}
+	shift := min(attempt-1, orderedRetryMaxShift)
+	window := s.retryBase << shift
+	var b [8]byte
+	orderedRandomBytes(b[:])
+	// #nosec G115 -- window is retryBase (a positive constant) shifted by at most
+	// orderedRetryMaxShift, so it is a small positive Duration; the modulus keeps
+	// the result inside it.
+	delay := time.Duration(binary.BigEndian.Uint64(b[:]) % uint64(window))
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // orderedLocation resolves the stream, counter subject, and record subject for a
@@ -208,7 +318,18 @@ func (s *orderedStore) Create(ctx context.Context, id storage.OrderedID, ranking
 		return storage.OrderedRecord{}, false, err
 	}
 
+	release, err := s.acquireScope(ctx, counterSubj)
+	if err != nil {
+		return storage.OrderedRecord{}, false, err
+	}
+	defer release()
+
 	for attempt := 1; attempt <= orderedCreateAttempts; attempt++ {
+		if attempt > 1 {
+			if err := s.waitBeforeRetry(ctx, attempt-1); err != nil {
+				return storage.OrderedRecord{}, false, err
+			}
+		}
 		counterSeq, counterData, err := s.seam.lastMsgForSubject(ctx, spec.stream, counterSubj)
 		if err != nil {
 			return storage.OrderedRecord{}, false, err
@@ -405,6 +526,15 @@ func (s *orderedStore) commitRevision(ctx context.Context, stream, subject strin
 	default:
 		return storage.OrderedRecord{}, err
 	}
+}
+
+// orderedRandomBytes fills b with cryptographically secure entropy. crypto/rand
+// is the only random source this module uses (per CLAUDE.md), and its Read is
+// documented never to return an error — it crashes the program irrecoverably
+// instead — so wrapping it in an error return would only add a branch no test
+// can reach.
+func orderedRandomBytes(b []byte) {
+	rand.Read(b)
 }
 
 // orderedRecordEqual reports whether two records are the same observable state.

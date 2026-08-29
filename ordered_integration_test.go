@@ -21,6 +21,14 @@ import (
 // classification rather than the fake used by the unit tests.
 func newOrderedTestStore(t *testing.T) (*orderedStore, *jetStreamOrderedSeam) {
 	t.Helper()
+	eng := newOrderedTestEngine(t)
+	seam := newOrderedTestSeam(t, eng)
+	return newOrderedStore(seam), seam
+}
+
+// newOrderedTestEngine stands up a fresh embedded engine for one test.
+func newOrderedTestEngine(t *testing.T) *Engine {
+	t.Helper()
 	root := t.TempDir()
 	t.Setenv("XDG_DATA_HOME", root)
 	eng, err := OpenEngine(EngineOptions{
@@ -31,12 +39,19 @@ func newOrderedTestStore(t *testing.T) (*orderedStore, *jetStreamOrderedSeam) {
 		t.Fatalf("OpenEngine: %v", err)
 	}
 	t.Cleanup(func() { _ = eng.Close() })
+	return eng
+}
+
+// newOrderedTestSeam binds a NEW production seam to an existing engine. Two
+// seams built this way share one connection, which is exactly the configuration
+// that exposes a batch-id namespace shared between independent writers.
+func newOrderedTestSeam(t *testing.T, eng *Engine) *jetStreamOrderedSeam {
+	t.Helper()
 	js, err := jetstream.New(eng.Conn())
 	if err != nil {
 		t.Fatalf("jetstream.New: %v", err)
 	}
-	seam := newJetStreamOrderedSeam(eng.Conn(), js)
-	return newOrderedStore(seam), seam
+	return newJetStreamOrderedSeam(eng.Conn(), js)
 }
 
 func orderedIntegrationID(key string) storage.OrderedID {
@@ -310,5 +325,140 @@ func TestOrderedStoreRejectsForeignStream(t *testing.T) {
 	}
 	if configErr.Stream != spec.stream {
 		t.Fatalf("Stream = %q, want %q", configErr.Stream, spec.stream)
+	}
+}
+
+// TestOrderedStoreConcurrentCreatesAcrossSeams is the regression test for
+// process-local batch ids. TestOrderedStoreConcurrentCreates drives a SINGLE
+// seam, whose atomic counter alone keeps its batch ids distinct; it is
+// structurally blind to two independent seams emitting the same id. The server
+// keys atomic-batch state by batch id within the stream and carries no client
+// identity, so two writers sharing an id abort each other's staged messages —
+// and an interleaving that happens to satisfy the server's batch-sequence gap
+// check commits a MIXED batch: one writer's counter with the other's record.
+func TestOrderedStoreConcurrentCreatesAcrossSeams(t *testing.T) {
+	eng := newOrderedTestEngine(t)
+	ctx := testCtx(t)
+	stores := []*orderedStore{
+		newOrderedStore(newOrderedTestSeam(t, eng)),
+		newOrderedStore(newOrderedTestSeam(t, eng)),
+	}
+
+	const perStore = 100
+	type outcome struct {
+		order   uint64
+		created bool
+		value   string
+		err     error
+	}
+	results := make([][]outcome, len(stores))
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for si, store := range stores {
+		results[si] = make([]outcome, perStore)
+		for i := range perStore {
+			wg.Add(1)
+			go func(si, i int) {
+				defer wg.Done()
+				<-start
+				key := "seam" + strconv.Itoa(si) + "-" + strconv.Itoa(i)
+				id := orderedIntegrationID(key)
+				rec, created, err := store.Create(ctx, id, "catalog/main", []byte(key), storage.Rank{}, storage.Due{})
+				results[si][i] = outcome{order: rec.Order, created: created, value: string(rec.Value), err: err}
+			}(si, i)
+		}
+	}
+	close(start)
+	wg.Wait()
+
+	var failures int
+	var first error
+	seen := map[uint64]string{}
+	for si := range results {
+		for i, got := range results[si] {
+			key := "seam" + strconv.Itoa(si) + "-" + strconv.Itoa(i)
+			if got.err != nil {
+				failures++
+				if first == nil {
+					first = got.err
+				}
+				continue
+			}
+			if !got.created {
+				t.Errorf("%s: created=false for a fresh identity", key)
+			}
+			// A mixed batch commits one writer's counter with another's record,
+			// so the value read back would not be the one this caller wrote.
+			if got.value != key {
+				t.Errorf("%s: record value = %q, want %q (a mixed batch committed)", key, got.value, key)
+			}
+			if prev, dup := seen[got.order]; dup {
+				t.Errorf("order %d handed to both %s and %s", got.order, prev, key)
+			}
+			seen[got.order] = key
+		}
+	}
+	if failures != 0 {
+		t.Fatalf("%d of %d creates failed; first error: %v", failures, len(stores)*perStore, first)
+	}
+	for want := uint64(1); want <= uint64(len(stores)*perStore); want++ {
+		if _, ok := seen[want]; !ok {
+			t.Fatalf("order %d was never allocated", want)
+		}
+	}
+}
+
+// TestOrderedStoreCreateContentionScales measures the retry loop under the
+// contention levels the bound must survive. Losers that retry in lockstep with
+// no delay re-collide immediately, so the cost per round is O(N) round trips and
+// the 64-attempt budget is reachable well below the "pathological" contention
+// the bound was documented to guard.
+func TestOrderedStoreCreateContentionScales(t *testing.T) {
+	for _, creators := range []int{128, 200} {
+		t.Run(strconv.Itoa(creators)+" creators", func(t *testing.T) {
+			store, _ := newOrderedTestStore(t)
+			ctx := testCtx(t)
+			errs := make([]error, creators)
+			orders := make([]uint64, creators)
+			var wg sync.WaitGroup
+			start := make(chan struct{})
+			began := time.Now()
+			for i := range creators {
+				wg.Add(1)
+				go func(i int) {
+					defer wg.Done()
+					<-start
+					id := orderedIntegrationID("scale-" + strconv.Itoa(creators) + "-" + strconv.Itoa(i))
+					rec, _, err := store.Create(ctx, id, "catalog/main", []byte(strconv.Itoa(i)), storage.Rank{}, storage.Due{})
+					errs[i] = err
+					orders[i] = rec.Order
+				}(i)
+			}
+			close(start)
+			wg.Wait()
+			elapsed := time.Since(began)
+
+			var failed int
+			var first error
+			for _, err := range errs {
+				if err != nil {
+					failed++
+					if first == nil {
+						first = err
+					}
+				}
+			}
+			t.Logf("%d creators: %d failures in %s", creators, failed, elapsed.Round(time.Millisecond))
+			if failed != 0 {
+				t.Fatalf("%d of %d creators failed; first error: %v", failed, creators, first)
+			}
+			seen := map[uint64]int{}
+			for i, order := range orders {
+				if prev, dup := seen[order]; dup {
+					t.Fatalf("order %d handed to creators %d and %d", order, prev, i)
+				}
+				seen[order] = i
+			}
+		})
 	}
 }
