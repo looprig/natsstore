@@ -228,6 +228,15 @@ func encodeOrderedRecord(rec storage.OrderedRecord) ([]byte, error) {
 // record's OWN identity must hash back to subject. The last gate is what makes a
 // hashed subject safe — without it, any writer who reached the stream could
 // serve a record under another identity's subject.
+//
+// Note what "strict" does NOT cover: DisallowUnknownFields rejects unknown keys,
+// but encoding/json accepts a DUPLICATED known key and keeps the last one, so
+// the stored bytes are not a canonical form and two distinct payloads can decode
+// to the same record. Nothing here depends on canonicality — the identity gate
+// re-derives the subject from the DECODED record, and no comparison in this
+// package hashes or compares raw payload bytes — so this is a note for a future
+// reader, not a hole. A change that starts treating the bytes as canonical
+// (content-addressing them, say) must add a duplicate-key check first.
 func decodeOrderedRecord(subject string, data []byte) (storage.OrderedRecord, error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()

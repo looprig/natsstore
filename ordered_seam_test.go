@@ -5,6 +5,7 @@ import (
 	"errors"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
@@ -71,6 +72,13 @@ func TestVerifyOrderedStreamConfigRejectsDrift(t *testing.T) {
 		{name: "unlimited history", mutate: func(c *jetstream.StreamConfig) { c.MaxMsgsPerSubject = -1 }},
 		{name: "extra subject", mutate: func(c *jetstream.StreamConfig) { c.Subjects = append(c.Subjects, "other.>") }},
 		{name: "wrong subject", mutate: func(c *jetstream.StreamConfig) { c.Subjects = []string{"other.>"} }},
+		// Every limit that could delete a record behind the store's back. Order is
+		// never reused, so an expired identity subject reads absent and the next
+		// Create reallocates an order that was already handed out.
+		{name: "records expire", mutate: func(c *jetstream.StreamConfig) { c.MaxAge = time.Hour }},
+		{name: "byte limit", mutate: func(c *jetstream.StreamConfig) { c.MaxBytes = 1 << 20 }},
+		{name: "message limit", mutate: func(c *jetstream.StreamConfig) { c.MaxMsgs = 1000 }},
+		{name: "discard new", mutate: func(c *jetstream.StreamConfig) { c.Discard = jetstream.DiscardNew }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

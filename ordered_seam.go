@@ -200,6 +200,35 @@ func verifyOrderedStreamConfig(spec orderedStreamSpec, cfg jetstream.StreamConfi
 			Reason: "subjects are not exactly " + strconv.Quote(spec.subjectFilter),
 		}
 	}
+	// Every limit that could delete a record behind the store's back. An ordered
+	// record is the authority for its identity and its order is never reused, so
+	// silent expiry is not a capacity policy — it is corruption: the identity
+	// subject would read absent and the next Create would reallocate an order that
+	// has already been handed out.
+	want := orderedStreamConfig(spec)
+	for _, limit := range []struct {
+		name string
+		got  int64
+		want int64
+	}{
+		{name: "max age", got: int64(cfg.MaxAge), want: int64(want.MaxAge)},
+		{name: "max bytes", got: cfg.MaxBytes, want: want.MaxBytes},
+		{name: "max messages", got: cfg.MaxMsgs, want: want.MaxMsgs},
+	} {
+		if limit.got != limit.want {
+			return &OrderedStreamConfigError{
+				Stream: spec.stream,
+				Reason: limit.name + " is " + strconv.FormatInt(limit.got, 10) +
+					", want " + strconv.FormatInt(limit.want, 10) + " (records must never expire)",
+			}
+		}
+	}
+	if cfg.Discard != want.Discard {
+		return &OrderedStreamConfigError{
+			Stream: spec.stream,
+			Reason: "discard policy is not the provisioned one",
+		}
+	}
 	return nil
 }
 
@@ -231,6 +260,12 @@ func (s *jetStreamOrderedSeam) lastMsgForSubject(ctx context.Context, streamName
 		if err != nil {
 			return 0, nil, &OrderedStreamOpError{Stream: streamName, Op: "lookup", Cause: err}
 		}
+		// Cache the handle. A read-only process never calls ensureStream, so
+		// without this every Get pays a lookup round trip forever — and the view
+		// hydration this store exists to feed is exactly that workload. It is as
+		// safe as the uncached path: the handle is a name binding, and a stream
+		// replaced underneath it fails the same way either way.
+		s.cacheStream(streamName, stream)
 	}
 	msg, err := stream.GetLastMsgForSubject(ctx, subject)
 	if errors.Is(err, jetstream.ErrMsgNotFound) {
@@ -340,6 +375,15 @@ func isOrderedWrongLastSeq(err error) bool {
 
 // isOrderedAmbiguous reports whether err leaves the outcome of a write unknown:
 // the request was sent but no acknowledgement came back.
+//
+// context.Canceled is deliberately NOT in the set, which is an asymmetry with
+// DeadlineExceeded worth spelling out: a cancelled request may well have
+// committed, so the classification is not "nothing happened". It is that
+// cancellation is caller-initiated — the caller chose to stop waiting and is the
+// one party able to decide what to do about a possibly-committed write, whereas
+// a deadline expiry is a fact about the server the caller must be told. Every
+// ordered mutation is idempotent by identity or fenced by revision, so a
+// cancelled caller that retries converges either way.
 func isOrderedAmbiguous(err error) bool {
 	return errors.Is(err, context.DeadlineExceeded) ||
 		errors.Is(err, nats.ErrTimeout) ||
