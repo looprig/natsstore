@@ -271,8 +271,11 @@ func (s *jetStreamOrderedSeam) ensureStream(ctx context.Context, spec orderedStr
 //     (Mirror is forbidden), ConsumerLimits.MaxAckPending (ordered consumers use
 //     AckNone), Metadata, deprecated Template, and AllowBatchPublish (the
 //     provider uses atomic batch publish).
-//   - Server-inaccessible drift: DiscardNewPerSubject=true is invalid under the
-//     required DiscardOld policy, so no accepted StreamInfo can carry it.
+//   - Server-inaccessible combinations: DiscardNewPerSubject=true is invalid
+//     under required DiscardOld; Mirror and AsyncPersistMode are invalid with
+//     required AllowAtomicPublish=true. Live tests pin those server error codes
+//     and separately prove Mirror/Async are represented when atomic publish is
+//     disabled, after which this verifier still fails closed.
 func verifyOrderedStreamConfig(spec orderedStreamSpec, cfg jetstream.StreamConfig) error {
 	want := orderedStreamConfig(spec)
 	if cfg.Description != orderedStreamDescription {

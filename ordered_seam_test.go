@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -60,6 +61,30 @@ func TestOrderedStreamConfig(t *testing.T) {
 	// The configuration the seam writes must be one the seam accepts.
 	if err := verifyOrderedStreamConfig(spec, cfg); err != nil {
 		t.Fatalf("the seam rejects its own configuration: %v", err)
+	}
+}
+
+// TestJetStreamStreamConfigFieldInventory pins the exact nats.go v1.53.1
+// surface reviewed by verifyOrderedStreamConfig. A dependency upgrade that adds
+// a field must fail here until its ordered-invariant classification is explicit.
+func TestJetStreamStreamConfigFieldInventory(t *testing.T) {
+	t.Parallel()
+	typ := reflect.TypeOf(jetstream.StreamConfig{})
+	got := make([]string, typ.NumField())
+	for i := range typ.NumField() {
+		got[i] = typ.Field(i).Name
+	}
+	want := []string{
+		"Name", "Description", "Subjects", "Retention", "MaxConsumers", "MaxMsgs", "MaxBytes",
+		"Discard", "DiscardNewPerSubject", "MaxAge", "MaxMsgsPerSubject", "MaxMsgSize", "Storage",
+		"Replicas", "NoAck", "Duplicates", "Placement", "Mirror", "Sources", "Sealed", "DenyDelete",
+		"DenyPurge", "AllowRollup", "Compression", "FirstSeq", "SubjectTransform", "RePublish",
+		"AllowDirect", "MirrorDirect", "ConsumerLimits", "Metadata", "Template", "AllowMsgTTL",
+		"SubjectDeleteMarkerTTL", "AllowMsgCounter", "AllowAtomicPublish", "AllowMsgSchedules",
+		"PersistMode", "AllowBatchPublish",
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("jetstream.StreamConfig fields = %v, want reviewed v1.53.1 inventory %v", got, want)
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/looprig/storage"
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
@@ -604,6 +606,177 @@ func TestOrderedStoreRejectsUnsafeZeroDefaultStreamFeatures(t *testing.T) {
 			}
 			if info.State.Msgs != initialMsgs {
 				t.Fatalf("rejected stream holds %d messages, want unchanged %d", info.State.Msgs, initialMsgs)
+			}
+		})
+	}
+}
+
+func TestOrderedStoreRejectsEveryServerRepresentableUnsafeStreamField(t *testing.T) {
+	type liveCase struct {
+		name      string
+		upstream  string
+		update    bool
+		mutate    func(orderedStreamSpec, string, *jetstream.StreamConfig)
+		preserved func(jetstream.StreamConfig) bool
+	}
+	cases := []liveCase{
+		{name: "description", mutate: func(_ orderedStreamSpec, _ string, c *jetstream.StreamConfig) { c.Description = "foreign" }, preserved: func(c jetstream.StreamConfig) bool { return c.Description == "foreign" }},
+		{name: "subjects", mutate: func(_ orderedStreamSpec, _ string, c *jetstream.StreamConfig) { c.Subjects = []string{"foreign.>"} }, preserved: func(c jetstream.StreamConfig) bool { return slices.Equal(c.Subjects, []string{"foreign.>"}) }},
+		{name: "retention", mutate: func(_ orderedStreamSpec, _ string, c *jetstream.StreamConfig) {
+			c.Retention = jetstream.WorkQueuePolicy
+		}, preserved: func(c jetstream.StreamConfig) bool { return c.Retention == jetstream.WorkQueuePolicy }},
+		{name: "max consumers", mutate: func(_ orderedStreamSpec, _ string, c *jetstream.StreamConfig) { c.MaxConsumers = 1 }, preserved: func(c jetstream.StreamConfig) bool { return c.MaxConsumers == 1 }},
+		{name: "max messages", mutate: func(_ orderedStreamSpec, _ string, c *jetstream.StreamConfig) { c.MaxMsgs = 10 }, preserved: func(c jetstream.StreamConfig) bool { return c.MaxMsgs == 10 }},
+		{name: "max bytes", mutate: func(_ orderedStreamSpec, _ string, c *jetstream.StreamConfig) { c.MaxBytes = 1 << 20 }, preserved: func(c jetstream.StreamConfig) bool { return c.MaxBytes == 1<<20 }},
+		{name: "discard", mutate: func(_ orderedStreamSpec, _ string, c *jetstream.StreamConfig) { c.Discard = jetstream.DiscardNew }, preserved: func(c jetstream.StreamConfig) bool { return c.Discard == jetstream.DiscardNew }},
+		{name: "max age", mutate: func(_ orderedStreamSpec, _ string, c *jetstream.StreamConfig) { c.MaxAge = time.Hour }, preserved: func(c jetstream.StreamConfig) bool { return c.MaxAge == time.Hour }},
+		{name: "per-subject history", mutate: func(_ orderedStreamSpec, _ string, c *jetstream.StreamConfig) { c.MaxMsgsPerSubject = 2 }, preserved: func(c jetstream.StreamConfig) bool { return c.MaxMsgsPerSubject == 2 }},
+		{name: "message size", mutate: func(_ orderedStreamSpec, _ string, c *jetstream.StreamConfig) { c.MaxMsgSize = orderedMaxMsgSize - 1 }, preserved: func(c jetstream.StreamConfig) bool { return c.MaxMsgSize == orderedMaxMsgSize-1 }},
+		{name: "storage", mutate: func(_ orderedStreamSpec, _ string, c *jetstream.StreamConfig) { c.Storage = jetstream.MemoryStorage }, preserved: func(c jetstream.StreamConfig) bool { return c.Storage == jetstream.MemoryStorage }},
+		{name: "no acknowledgements", mutate: func(_ orderedStreamSpec, _ string, c *jetstream.StreamConfig) { c.NoAck = true }, preserved: func(c jetstream.StreamConfig) bool { return c.NoAck }},
+		{name: "mirror", upstream: "mirror", mutate: func(_ orderedStreamSpec, source string, c *jetstream.StreamConfig) {
+			c.Subjects = nil
+			c.Mirror = &jetstream.StreamSource{Name: source}
+			c.AllowAtomicPublish = false
+		}, preserved: func(c jetstream.StreamConfig) bool { return c.Mirror != nil }},
+		{name: "sources", upstream: "source", mutate: func(_ orderedStreamSpec, source string, c *jetstream.StreamConfig) {
+			c.Sources = []*jetstream.StreamSource{{Name: source}}
+		}, preserved: func(c jetstream.StreamConfig) bool { return len(c.Sources) == 1 }},
+		{name: "sealed", update: true, mutate: func(_ orderedStreamSpec, _ string, c *jetstream.StreamConfig) { c.Sealed = true }, preserved: func(c jetstream.StreamConfig) bool { return c.Sealed }},
+		{name: "rollup", mutate: func(_ orderedStreamSpec, _ string, c *jetstream.StreamConfig) { c.AllowRollup = true }, preserved: func(c jetstream.StreamConfig) bool { return c.AllowRollup }},
+		{name: "first sequence", mutate: func(_ orderedStreamSpec, _ string, c *jetstream.StreamConfig) { c.FirstSeq = 100 }, preserved: func(c jetstream.StreamConfig) bool { return c.FirstSeq == 100 }},
+		{name: "subject transform", mutate: func(spec orderedStreamSpec, _ string, c *jetstream.StreamConfig) {
+			c.SubjectTransform = &jetstream.SubjectTransformConfig{Source: spec.subjectFilter, Destination: "redirect.>"}
+		}, preserved: func(c jetstream.StreamConfig) bool { return c.SubjectTransform != nil }},
+		{name: "republish", mutate: func(spec orderedStreamSpec, _ string, c *jetstream.StreamConfig) {
+			c.RePublish = &jetstream.RePublish{Source: spec.subjectFilter, Destination: "audit.>"}
+		}, preserved: func(c jetstream.StreamConfig) bool { return c.RePublish != nil }},
+		{name: "message ttl", mutate: func(_ orderedStreamSpec, _ string, c *jetstream.StreamConfig) { c.AllowMsgTTL = true }, preserved: func(c jetstream.StreamConfig) bool { return c.AllowMsgTTL }},
+		{name: "delete marker ttl", mutate: func(_ orderedStreamSpec, _ string, c *jetstream.StreamConfig) { c.SubjectDeleteMarkerTTL = time.Minute }, preserved: func(c jetstream.StreamConfig) bool { return c.SubjectDeleteMarkerTTL == time.Minute }},
+		{name: "message counter", mutate: func(_ orderedStreamSpec, _ string, c *jetstream.StreamConfig) { c.AllowMsgCounter = true }, preserved: func(c jetstream.StreamConfig) bool { return c.AllowMsgCounter }},
+		{name: "atomic publish disabled", mutate: func(_ orderedStreamSpec, _ string, c *jetstream.StreamConfig) { c.AllowAtomicPublish = false }, preserved: func(c jetstream.StreamConfig) bool { return !c.AllowAtomicPublish }},
+		{name: "message schedules", mutate: func(_ orderedStreamSpec, _ string, c *jetstream.StreamConfig) { c.AllowMsgSchedules = true }, preserved: func(c jetstream.StreamConfig) bool { return c.AllowMsgSchedules }},
+		{name: "async persistence", mutate: func(_ orderedStreamSpec, _ string, c *jetstream.StreamConfig) {
+			c.PersistMode = jetstream.AsyncPersistMode
+			c.AllowAtomicPublish = false
+		}, preserved: func(c jetstream.StreamConfig) bool { return c.PersistMode == jetstream.AsyncPersistMode }},
+		{name: "restrictive consumer inactivity", mutate: func(_ orderedStreamSpec, _ string, c *jetstream.StreamConfig) {
+			c.ConsumerLimits.InactiveThreshold = orderedViewInactiveThreshold - time.Second
+		}, preserved: func(c jetstream.StreamConfig) bool {
+			return c.ConsumerLimits.InactiveThreshold == orderedViewInactiveThreshold-time.Second
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store, seam := newOrderedTestStore(t)
+			ctx := testCtx(t)
+			id := orderedIntegrationID("live-field-" + strings.ReplaceAll(tc.name, " ", "-"))
+			spec, _, _, err := orderedLocation(id)
+			if err != nil {
+				t.Fatalf("orderedLocation: %v", err)
+			}
+			var sourceName string
+			if tc.upstream != "" {
+				sourceName = spec.stream + "_UPSTREAM"
+				_, err := seam.js.CreateStream(ctx, jetstream.StreamConfig{
+					Name: sourceName, Subjects: []string{"upstream." + spec.stream + ".>"}, Storage: jetstream.FileStorage,
+				})
+				if err != nil {
+					t.Fatalf("CreateStream(upstream): %v", err)
+				}
+			}
+			cfg := orderedStreamConfig(spec)
+			if tc.update {
+				if _, err := seam.js.CreateStream(ctx, cfg); err != nil {
+					t.Fatalf("CreateStream(base): %v", err)
+				}
+			}
+			tc.mutate(spec, sourceName, &cfg)
+			var stream jetstream.Stream
+			if tc.update {
+				stream, err = seam.js.UpdateStream(ctx, cfg)
+			} else {
+				stream, err = seam.js.CreateStream(ctx, cfg)
+			}
+			if err != nil {
+				t.Fatalf("provision unsafe stream: %v", err)
+			}
+			info, err := stream.Info(ctx)
+			if err != nil {
+				t.Fatalf("StreamInfo: %v", err)
+			}
+			if !tc.preserved(info.Config) {
+				t.Fatalf("server did not preserve unsafe %s config: %+v", tc.name, info.Config)
+			}
+			initialMsgs := info.State.Msgs
+
+			_, getErr := store.Get(ctx, id)
+			var configErr *OrderedStreamConfigError
+			if !errors.As(getErr, &configErr) {
+				t.Fatalf("Get = %T %v, want *OrderedStreamConfigError", getErr, getErr)
+			}
+			if _, ok := seam.cachedVerifiedStream(spec.stream); ok {
+				t.Fatal("Get cached a server-preserved unsafe stream")
+			}
+			_, created, createErr := store.Create(ctx, id, "catalog/main", []byte("unsafe"), storage.Rank{}, storage.Due{})
+			if created || !errors.As(createErr, &configErr) {
+				t.Fatalf("Create after Get = created %v, err %T %v; want false, *OrderedStreamConfigError", created, createErr, createErr)
+			}
+			info, err = stream.Info(ctx)
+			if err != nil {
+				t.Fatalf("StreamInfo after rejection: %v", err)
+			}
+			if info.State.Msgs != initialMsgs {
+				t.Fatalf("provider changed message count from %d to %d", initialMsgs, info.State.Msgs)
+			}
+		})
+	}
+}
+
+func TestOrderedServerRejectsInaccessibleStreamConfigCombinations(t *testing.T) {
+	const jsMirrorWithAtomicPublish jetstream.ErrorCode = 10198
+	for _, tc := range []struct {
+		name     string
+		wantCode jetstream.ErrorCode
+		mutate   func(context.Context, *jetStreamOrderedSeam, orderedStreamSpec, *jetstream.StreamConfig) error
+	}{
+		{name: "discard new per subject under discard old", wantCode: jetstream.ErrorCode(nats.JSStreamInvalidConfig), mutate: func(_ context.Context, _ *jetStreamOrderedSeam, _ orderedStreamSpec, c *jetstream.StreamConfig) error {
+			c.DiscardNewPerSubject = true
+			return nil
+		}},
+		{name: "mirror with atomic publish", wantCode: jsMirrorWithAtomicPublish, mutate: func(ctx context.Context, seam *jetStreamOrderedSeam, spec orderedStreamSpec, c *jetstream.StreamConfig) error {
+			sourceName := spec.stream + "_UPSTREAM"
+			if _, err := seam.js.CreateStream(ctx, jetstream.StreamConfig{Name: sourceName, Subjects: []string{"upstream." + spec.stream + ".>"}}); err != nil {
+				return err
+			}
+			c.Subjects = nil
+			c.Mirror = &jetstream.StreamSource{Name: sourceName}
+			return nil
+		}},
+		{name: "async persistence with atomic publish", wantCode: jetstream.ErrorCode(nats.JSStreamInvalidConfig), mutate: func(_ context.Context, _ *jetStreamOrderedSeam, _ orderedStreamSpec, c *jetstream.StreamConfig) error {
+			c.PersistMode = jetstream.AsyncPersistMode
+			return nil
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, seam := newOrderedTestStore(t)
+			ctx := testCtx(t)
+			id := orderedIntegrationID("server-inaccessible-" + strings.ReplaceAll(tc.name, " ", "-"))
+			spec, _, _, err := orderedLocation(id)
+			if err != nil {
+				t.Fatalf("orderedLocation: %v", err)
+			}
+			cfg := orderedStreamConfig(spec)
+			if err := tc.mutate(ctx, seam, spec, &cfg); err != nil {
+				t.Fatalf("prepare inaccessible config: %v", err)
+			}
+			_, err = seam.js.CreateStream(ctx, cfg)
+			var apiErr *jetstream.APIError
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("CreateStream = %T %v, want *jetstream.APIError", err, err)
+			}
+			if apiErr.ErrorCode != tc.wantCode {
+				t.Fatalf("ErrorCode = %d, want %d", apiErr.ErrorCode, tc.wantCode)
 			}
 		})
 	}
