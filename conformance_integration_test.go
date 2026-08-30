@@ -239,9 +239,9 @@ func TestBlobsConformance(t *testing.T) {
 
 // TestBlobReaderCloseBoundWithMissingChunks is the provider-native nonvacuity
 // proof for Blob reader shutdown. It leaves valid object metadata in place but
-// purges the referenced chunks, forcing nats.go's ObjectResult.Read to wait on
-// its network pipe. Close must wait behind that active Read, and both must return
-// within the provider's advertised bound rather than the caller's later deadline.
+// purges the referenced chunks, forcing the provider-owned plain pull consumer's
+// Messages.Next to block. Close must stop that active wait, and both operations
+// must return within the provider's advertised bound rather than the caller's later deadline.
 func TestBlobReaderCloseBoundWithMissingChunks(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("XDG_DATA_HOME", root)
