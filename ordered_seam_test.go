@@ -54,6 +54,9 @@ func TestOrderedStreamConfig(t *testing.T) {
 	if cfg.Retention != jetstream.LimitsPolicy {
 		t.Fatalf("Retention = %v, want LimitsPolicy", cfg.Retention)
 	}
+	if cfg.MaxConsumers != -1 {
+		t.Fatalf("MaxConsumers = %d, want -1 (unlimited materialized views)", cfg.MaxConsumers)
+	}
 	// The configuration the seam writes must be one the seam accepts.
 	if err := verifyOrderedStreamConfig(spec, cfg); err != nil {
 		t.Fatalf("the seam rejects its own configuration: %v", err)
@@ -85,6 +88,25 @@ func TestVerifyOrderedStreamConfigRejectsDrift(t *testing.T) {
 		{name: "interest retention", mutate: func(c *jetstream.StreamConfig) { c.Retention = jetstream.InterestPolicy }},
 		{name: "memory storage", mutate: func(c *jetstream.StreamConfig) { c.Storage = jetstream.MemoryStorage }},
 		{name: "message size below ordered ceiling", mutate: func(c *jetstream.StreamConfig) { c.MaxMsgSize = orderedMaxMsgSize - 1 }},
+		{name: "consumer limit", mutate: func(c *jetstream.StreamConfig) { c.MaxConsumers = 1 }},
+		{name: "acknowledgements disabled", mutate: func(c *jetstream.StreamConfig) { c.NoAck = true }},
+		{name: "mirror", mutate: func(c *jetstream.StreamConfig) { c.Mirror = &jetstream.StreamSource{Name: "FOREIGN"} }},
+		{name: "source", mutate: func(c *jetstream.StreamConfig) { c.Sources = []*jetstream.StreamSource{{Name: "FOREIGN"}} }},
+		{name: "sealed", mutate: func(c *jetstream.StreamConfig) { c.Sealed = true }},
+		{name: "rollup", mutate: func(c *jetstream.StreamConfig) { c.AllowRollup = true }},
+		{name: "first sequence", mutate: func(c *jetstream.StreamConfig) { c.FirstSeq = 100 }},
+		{name: "subject transform", mutate: func(c *jetstream.StreamConfig) {
+			c.SubjectTransform = &jetstream.SubjectTransformConfig{Source: spec.subjectFilter, Destination: "redirect.>"}
+		}},
+		{name: "republish", mutate: func(c *jetstream.StreamConfig) { c.RePublish = &jetstream.RePublish{Destination: "audit.>"} }},
+		{name: "message ttl", mutate: func(c *jetstream.StreamConfig) { c.AllowMsgTTL = true }},
+		{name: "message counter", mutate: func(c *jetstream.StreamConfig) { c.AllowMsgCounter = true }},
+		{name: "message schedules", mutate: func(c *jetstream.StreamConfig) { c.AllowMsgSchedules = true }},
+		{name: "async persistence", mutate: func(c *jetstream.StreamConfig) { c.PersistMode = jetstream.AsyncPersistMode }},
+		{name: "consumer inactivity limit below provider request", mutate: func(c *jetstream.StreamConfig) {
+			c.ConsumerLimits.InactiveThreshold = orderedViewInactiveThreshold - time.Second
+		}},
+		{name: "subject delete marker ttl", mutate: func(c *jetstream.StreamConfig) { c.SubjectDeleteMarkerTTL = time.Minute }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -113,6 +135,19 @@ func TestVerifyOrderedStreamConfigAllowsSafeOperationalDrift(t *testing.T) {
 		{name: "more replicas", mutate: func(c *jetstream.StreamConfig) { c.Replicas = 3 }},
 		{name: "larger message ceiling", mutate: func(c *jetstream.StreamConfig) { c.MaxMsgSize++ }},
 		{name: "unlimited message ceiling", mutate: func(c *jetstream.StreamConfig) { c.MaxMsgSize = -1 }},
+		{name: "duplicate tracking window", mutate: func(c *jetstream.StreamConfig) { c.Duplicates = time.Minute }},
+		{name: "placement", mutate: func(c *jetstream.StreamConfig) { c.Placement = &jetstream.Placement{Cluster: "operator-choice"} }},
+		{name: "deny delete", mutate: func(c *jetstream.StreamConfig) { c.DenyDelete = true }},
+		{name: "deny purge", mutate: func(c *jetstream.StreamConfig) { c.DenyPurge = true }},
+		{name: "compression", mutate: func(c *jetstream.StreamConfig) { c.Compression = jetstream.S2Compression }},
+		{name: "direct reads", mutate: func(c *jetstream.StreamConfig) { c.AllowDirect = true }},
+		{name: "mirror direct irrelevant without mirror", mutate: func(c *jetstream.StreamConfig) { c.MirrorDirect = true }},
+		{name: "consumer defaults", mutate: func(c *jetstream.StreamConfig) {
+			c.ConsumerLimits = jetstream.StreamConsumerLimits{InactiveThreshold: time.Minute, MaxAckPending: 100}
+		}},
+		{name: "metadata", mutate: func(c *jetstream.StreamConfig) { c.Metadata = map[string]string{"owner": "operator"} }},
+		{name: "deprecated template marker", mutate: func(c *jetstream.StreamConfig) { c.Template = "legacy" }},
+		{name: "batch publish extension", mutate: func(c *jetstream.StreamConfig) { c.AllowBatchPublish = true }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

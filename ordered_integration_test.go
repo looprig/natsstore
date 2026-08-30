@@ -504,6 +504,111 @@ func TestOrderedStoreReadBeforeCreateRejectsLoadBearingStreamDrift(t *testing.T)
 	}
 }
 
+func TestOrderedStoreRejectsUnsafeZeroDefaultStreamFeatures(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(orderedStreamSpec, *jetstream.StreamConfig)
+	}{
+		{name: "subject transform", mutate: func(spec orderedStreamSpec, c *jetstream.StreamConfig) {
+			c.SubjectTransform = &jetstream.SubjectTransformConfig{Source: spec.subjectFilter, Destination: "redirect.>"}
+		}},
+		{name: "no acknowledgements", mutate: func(_ orderedStreamSpec, c *jetstream.StreamConfig) { c.NoAck = true }},
+		{name: "nonzero first sequence", mutate: func(_ orderedStreamSpec, c *jetstream.StreamConfig) { c.FirstSeq = 100 }},
+		{name: "restrictive consumer inactivity", mutate: func(_ orderedStreamSpec, c *jetstream.StreamConfig) {
+			c.ConsumerLimits.InactiveThreshold = orderedViewInactiveThreshold - time.Second
+		}},
+		{name: "subject delete marker ttl", mutate: func(_ orderedStreamSpec, c *jetstream.StreamConfig) {
+			c.SubjectDeleteMarkerTTL = time.Minute
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, seam := newOrderedTestStore(t)
+			ctx := testCtx(t)
+			id := orderedIntegrationID("unsafe-zero-default-" + strings.ReplaceAll(tc.name, " ", "-"))
+			spec, _, subject, err := orderedLocation(id)
+			if err != nil {
+				t.Fatalf("orderedLocation: %v", err)
+			}
+			cfg := orderedStreamConfig(spec)
+			tc.mutate(spec, &cfg)
+			stream, err := seam.js.CreateStream(ctx, cfg)
+			if err != nil {
+				t.Fatalf("CreateStream(%s): %v", tc.name, err)
+			}
+			info, err := stream.Info(ctx)
+			if err != nil {
+				t.Fatalf("StreamInfo: %v", err)
+			}
+			if tc.name == "subject transform" && info.Config.SubjectTransform == nil {
+				t.Fatal("server did not preserve SubjectTransform")
+			}
+			if tc.name == "no acknowledgements" && !info.Config.NoAck {
+				t.Fatal("server did not preserve NoAck")
+			}
+			if tc.name == "nonzero first sequence" && info.Config.FirstSeq != 100 {
+				t.Fatalf("server FirstSeq = %d, want 100", info.Config.FirstSeq)
+			}
+			if tc.name == "restrictive consumer inactivity" && info.Config.ConsumerLimits.InactiveThreshold != orderedViewInactiveThreshold-time.Second {
+				t.Fatalf("server consumer inactive threshold = %v, want %v", info.Config.ConsumerLimits.InactiveThreshold, orderedViewInactiveThreshold-time.Second)
+			}
+			if tc.name == "subject delete marker ttl" {
+				if info.Config.SubjectDeleteMarkerTTL != time.Minute {
+					t.Fatalf("server subject delete marker TTL = %v, want %v", info.Config.SubjectDeleteMarkerTTL, time.Minute)
+				}
+				if !info.Config.AllowMsgTTL || !info.Config.AllowRollup {
+					t.Fatalf("server normalized marker TTL to AllowMsgTTL=%v AllowRollup=%v, want both true", info.Config.AllowMsgTTL, info.Config.AllowRollup)
+				}
+			}
+			if tc.name == "restrictive consumer inactivity" {
+				seedUnsafeOrderedRecord(t, ctx, seam, subject, id)
+				info, err = stream.Info(ctx)
+				if err != nil {
+					t.Fatalf("StreamInfo after seed: %v", err)
+				}
+			}
+			initialMsgs := info.State.Msgs
+			if tc.name == "nonzero first sequence" {
+				queryCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+				defer cancel()
+				_, queryErr := store.ListDue(queryCtx, id.Namespace, 100, "", 10)
+				var configErr *OrderedStreamConfigError
+				if !errors.As(queryErr, &configErr) {
+					t.Fatalf("ListDue(empty stream with FirstSeq) = %T %v, want *OrderedStreamConfigError without waiting for watermark", queryErr, queryErr)
+				}
+			}
+			if tc.name == "restrictive consumer inactivity" {
+				queryCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+				defer cancel()
+				_, queryErr := store.ListDue(queryCtx, id.Namespace, 100, "", 10)
+				var configErr *OrderedStreamConfigError
+				if !errors.As(queryErr, &configErr) {
+					t.Fatalf("ListDue(restrictive consumer inactivity) = %T %v, want *OrderedStreamConfigError", queryErr, queryErr)
+				}
+			}
+
+			_, getErr := store.Get(ctx, id)
+			var configErr *OrderedStreamConfigError
+			if !errors.As(getErr, &configErr) {
+				t.Fatalf("Get = %T %v, want *OrderedStreamConfigError", getErr, getErr)
+			}
+			if _, ok := seam.cachedVerifiedStream(spec.stream); ok {
+				t.Fatal("Get cached a stream with rejected zero/default drift")
+			}
+			_, created, createErr := store.Create(ctx, id, "catalog/main", []byte("unsafe"), storage.Rank{}, storage.Due{})
+			if created || !errors.As(createErr, &configErr) {
+				t.Fatalf("Create after Get = created %v, err %T %v; want false, *OrderedStreamConfigError", created, createErr, createErr)
+			}
+			info, err = stream.Info(ctx)
+			if err != nil {
+				t.Fatalf("StreamInfo after rejection: %v", err)
+			}
+			if info.State.Msgs != initialMsgs {
+				t.Fatalf("rejected stream holds %d messages, want unchanged %d", info.State.Msgs, initialMsgs)
+			}
+		})
+	}
+}
+
 func seedUnsafeOrderedRecord(t *testing.T, ctx context.Context, seam *jetStreamOrderedSeam, subject string, id storage.OrderedID) {
 	t.Helper()
 	payload, err := encodeOrderedRecord(storage.OrderedRecord{

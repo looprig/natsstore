@@ -215,6 +215,7 @@ func orderedStreamConfig(spec orderedStreamSpec) jetstream.StreamConfig {
 		Description:        orderedStreamDescription,
 		Subjects:           []string{spec.subjectFilter},
 		Retention:          jetstream.LimitsPolicy,
+		MaxConsumers:       -1,
 		Discard:            jetstream.DiscardOld,
 		Storage:            jetstream.FileStorage,
 		MaxMsgs:            -1,
@@ -249,12 +250,29 @@ func (s *jetStreamOrderedSeam) ensureStream(ctx context.Context, spec orderedStr
 	return s.verifyAndCacheStream(ctx, spec, stream)
 }
 
-// verifyOrderedStreamConfig checks every provisioned field that the ordered
-// design depends on. Name is already fixed by the named lookup. Description,
-// subjects, retention, discard, storage, deletion limits, per-subject history,
-// the message-size floor, and atomic publish are load-bearing and checked here.
-// More replicas and a larger (or unlimited) message ceiling are safe operational
-// drift; other unprovisioned fields remain the operator's business.
+// verifyOrderedStreamConfig classifies every StreamConfig field against the
+// ordered invariants:
+//   - Required exactly: Description, Subjects, Retention, unlimited
+//     MaxConsumers, MaxMsgs/MaxBytes/MaxAge, Discard, MaxMsgsPerSubject,
+//     Storage, NoAck=false, Mirror/Sources=nil, Sealed=false,
+//     AllowRollup=false, FirstSeq=0, SubjectTransform/RePublish=nil,
+//     AllowMsgTTL/AllowMsgCounter/AllowMsgSchedules=false,
+//     SubjectDeleteMarkerTTL=0, AllowAtomicPublish=true, and
+//     PersistMode=Default. These fields can remove, inject, redirect, or fail to
+//     durably acknowledge authority, or prevent the materialized consumers and
+//     mutations the provider requires. Name is also exact, but is established
+//     by the named lookup that produced the handle.
+//   - Bounded safe drift: MaxMsgSize may exceed the provisioned floor or be
+//     unlimited; Replicas may exceed the provisioned single replica; a stream
+//     ConsumerLimits.InactiveThreshold may be unlimited or at least the fixed
+//     threshold requested by ordered views.
+//   - Irrelevant safe drift: Duplicates (provider sends no message ids),
+//     Placement, DenyDelete, DenyPurge, Compression, AllowDirect, MirrorDirect
+//     (Mirror is forbidden), ConsumerLimits.MaxAckPending (ordered consumers use
+//     AckNone), Metadata, deprecated Template, and AllowBatchPublish (the
+//     provider uses atomic batch publish).
+//   - Server-inaccessible drift: DiscardNewPerSubject=true is invalid under the
+//     required DiscardOld policy, so no accepted StreamInfo can carry it.
 func verifyOrderedStreamConfig(spec orderedStreamSpec, cfg jetstream.StreamConfig) error {
 	want := orderedStreamConfig(spec)
 	if cfg.Description != orderedStreamDescription {
@@ -285,11 +303,76 @@ func verifyOrderedStreamConfig(spec orderedStreamSpec, cfg jetstream.StreamConfi
 				" (consumers must not remove authoritative records)",
 		}
 	}
+	if cfg.MaxConsumers != want.MaxConsumers {
+		return &OrderedStreamConfigError{
+			Stream: spec.stream,
+			Reason: "max consumers is " + strconv.Itoa(cfg.MaxConsumers) + ", want " +
+				strconv.Itoa(want.MaxConsumers) + " (materialized views must remain available)",
+		}
+	}
 	if cfg.Storage != want.Storage {
 		return &OrderedStreamConfigError{
 			Stream: spec.stream,
 			Reason: "storage is " + cfg.Storage.String() + ", want " + want.Storage.String() +
 				" (ordered records must survive restart)",
+		}
+	}
+	if cfg.NoAck {
+		return &OrderedStreamConfigError{Stream: spec.stream, Reason: "publish acknowledgements are disabled"}
+	}
+	if cfg.Mirror != nil {
+		return &OrderedStreamConfigError{Stream: spec.stream, Reason: "mirror is configured (foreign messages can become authority)"}
+	}
+	if len(cfg.Sources) != 0 {
+		return &OrderedStreamConfigError{Stream: spec.stream, Reason: "sources are configured (foreign messages can become authority)"}
+	}
+	if cfg.Sealed {
+		return &OrderedStreamConfigError{Stream: spec.stream, Reason: "stream is sealed (ordered mutations require publishing)"}
+	}
+	if cfg.AllowRollup {
+		return &OrderedStreamConfigError{Stream: spec.stream, Reason: "rollup is enabled (authority can be deleted by a publish)"}
+	}
+	if cfg.FirstSeq != want.FirstSeq {
+		return &OrderedStreamConfigError{
+			Stream: spec.stream,
+			Reason: "first sequence is " + strconv.FormatUint(cfg.FirstSeq, 10) + ", want " +
+				strconv.FormatUint(want.FirstSeq, 10) + " (empty view watermarks start at zero)",
+		}
+	}
+	if cfg.SubjectTransform != nil {
+		return &OrderedStreamConfigError{Stream: spec.stream, Reason: "subject transform is configured (CAS subjects must not be redirected)"}
+	}
+	if cfg.RePublish != nil {
+		return &OrderedStreamConfigError{Stream: spec.stream, Reason: "republish is configured (ordered commits must have no foreign side effects)"}
+	}
+	if cfg.AllowMsgTTL {
+		return &OrderedStreamConfigError{Stream: spec.stream, Reason: "per-message TTL is enabled (authority must never expire)"}
+	}
+	if cfg.AllowMsgCounter {
+		return &OrderedStreamConfigError{Stream: spec.stream, Reason: "message counters are enabled (ordered payloads must retain ordinary message semantics)"}
+	}
+	if cfg.AllowMsgSchedules {
+		return &OrderedStreamConfigError{Stream: spec.stream, Reason: "message schedules are enabled (delayed foreign messages can become authority)"}
+	}
+	if cfg.SubjectDeleteMarkerTTL != 0 {
+		return &OrderedStreamConfigError{
+			Stream: spec.stream,
+			Reason: "subject delete marker TTL is " + cfg.SubjectDeleteMarkerTTL.String() +
+				", want 0s (server normalization enables message TTL and rollup)",
+		}
+	}
+	if cfg.PersistMode != want.PersistMode {
+		return &OrderedStreamConfigError{
+			Stream: spec.stream,
+			Reason: "persist mode is " + cfg.PersistMode.String() + ", want " + want.PersistMode.String() +
+				" (publish acknowledgements must follow persistence)",
+		}
+	}
+	if limit := cfg.ConsumerLimits.InactiveThreshold; limit > 0 && limit < orderedViewInactiveThreshold {
+		return &OrderedStreamConfigError{
+			Stream: spec.stream,
+			Reason: "consumer inactive threshold limit is " + limit.String() + ", want 0s or at least " +
+				orderedViewInactiveThreshold.String(),
 		}
 	}
 	if cfg.MaxMsgSize != -1 && cfg.MaxMsgSize < want.MaxMsgSize {
