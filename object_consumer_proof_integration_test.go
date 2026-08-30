@@ -15,10 +15,10 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 )
 
-// TestObjectConsumerCapabilityProof pins the public-API capability required by
-// the provider-owned blob reader before that reader is accepted as production
-// code. It intentionally uses JetStream APIs directly rather than the provider.
-func TestObjectConsumerCapabilityProof(t *testing.T) {
+// TestPlainObjectConsumerCapabilityProof pins the public-API capability required
+// by the provider-owned blob reader. It intentionally uses JetStream APIs
+// directly to prove that a plain pull consumer has no OrderedConsumer reset path.
+func TestPlainObjectConsumerCapabilityProof(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("XDG_DATA_HOME", root)
 	eng, err := OpenEngine(EngineOptions{DataDir: filepath.Join(root, "jetstream"), SyncInterval: 50 * time.Millisecond})
@@ -58,15 +58,22 @@ func TestObjectConsumerCapabilityProof(t *testing.T) {
 		t.Fatalf("ObjectStore layout = %#v; want stream %q with chunk wildcard", streamInfo, streamName)
 	}
 
-	consumer, err := stream.OrderedConsumer(ctx, jetstream.OrderedConsumerConfig{
-		FilterSubjects:    []string{chunkSubject},
+	consumer, err := stream.CreateConsumer(ctx, jetstream.ConsumerConfig{
+		AckPolicy:         jetstream.AckNonePolicy,
+		FilterSubject:     chunkSubject,
 		DeliverPolicy:     jetstream.DeliverAllPolicy,
 		InactiveThreshold: time.Second,
+		MemoryStorage:     true,
+		MaxRequestBatch:   1,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	consumerName := consumer.CachedInfo().Name
+	consumerInfo := consumer.CachedInfo()
+	if consumerInfo == nil || consumerInfo.Config.AckPolicy != jetstream.AckNonePolicy || consumerInfo.Config.DeliverPolicy != jetstream.DeliverAllPolicy || consumerInfo.Config.FilterSubject != chunkSubject || !consumerInfo.Config.MemoryStorage || consumerInfo.Config.InactiveThreshold != time.Second || consumerInfo.Config.MaxRequestBatch != 1 {
+		t.Fatalf("plain consumer config = %#v", consumerInfo)
+	}
+	consumerName := consumerInfo.Name
 	messages, err := consumer.Messages(jetstream.PullMaxMessages(1))
 	if err != nil {
 		t.Fatal(err)
@@ -83,7 +90,7 @@ func TestObjectConsumerCapabilityProof(t *testing.T) {
 		if metaErr != nil {
 			t.Fatal(metaErr)
 		}
-		if msg.Subject() != chunkSubject || meta.Stream != streamName || meta.Sequence.Consumer != uint64(chunk) || meta.Sequence.Stream <= previousStreamSeq || meta.NumPending != uint64(info.Chunks-chunk) {
+		if msg.Subject() != chunkSubject || meta.Stream != streamName || meta.Sequence.Stream <= previousStreamSeq || meta.NumPending != uint64(info.Chunks-chunk) {
 			t.Fatalf("chunk %d metadata = subject %q stream %q consumer seq %d stream seq %d pending %d", chunk, msg.Subject(), meta.Stream, meta.Sequence.Consumer, meta.Sequence.Stream, meta.NumPending)
 		}
 		previousStreamSeq = meta.Sequence.Stream
@@ -94,15 +101,18 @@ func TestObjectConsumerCapabilityProof(t *testing.T) {
 		t.Fatalf("progressive read lasted %v, want >5s", elapsed)
 	}
 	if !bytes.Equal(got.Bytes(), want) || sha256.Sum256(got.Bytes()) != sha256.Sum256(want) {
-		t.Fatal("progressive ordered-consumer stream did not preserve bytes/digest")
+		t.Fatal("progressive plain-consumer stream did not preserve bytes/digest")
 	}
 	messages.Stop()
 	assertConsumerCleaned(t, ctx, stream, consumerName, 4*time.Second)
 
-	blocked, err := stream.OrderedConsumer(ctx, jetstream.OrderedConsumerConfig{
-		FilterSubjects:    []string{objectChunkPrefix + bucket + objectChunkMarker + "MISSING"},
+	blocked, err := stream.CreateConsumer(ctx, jetstream.ConsumerConfig{
+		AckPolicy:         jetstream.AckNonePolicy,
+		FilterSubject:     objectChunkPrefix + bucket + objectChunkMarker + "MISSING",
 		DeliverPolicy:     jetstream.DeliverAllPolicy,
 		InactiveThreshold: time.Second,
+		MemoryStorage:     true,
+		MaxRequestBatch:   1,
 	})
 	if err != nil {
 		t.Fatal(err)

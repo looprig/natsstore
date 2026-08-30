@@ -280,7 +280,7 @@ type jetStreamObjectSeam struct {
 
 type objectConsumerManager interface {
 	ObjectStore(context.Context, string) (jetstream.ObjectStore, error)
-	OrderedConsumer(context.Context, string, jetstream.OrderedConsumerConfig) (jetstream.Consumer, error)
+	CreateConsumer(context.Context, string, jetstream.ConsumerConfig) (jetstream.Consumer, error)
 }
 
 var _ objSeam = (*jetStreamObjectSeam)(nil)
@@ -308,16 +308,24 @@ const (
 var errObjectIntegrity = errors.New("natsstore: object integrity failure")
 
 // get resolves ObjectStore links, then streams the exact chunk subject through
-// a provider-owned ordered pull consumer. Each Next has its own five-second
+// a provider-owned ephemeral pull consumer. Each Next has its own five-second
 // ceiling; there is deliberately no absolute lifetime for a progressing reader.
 func (s *jetStreamObjectSeam) get(ctx context.Context, key string) (io.ReadCloser, error) {
-	info, err := s.resolveObjectInfo(ctx, s.obj, key, make(map[string]struct{}), 0)
+	status, err := s.obj.Status(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if isNilInterface(status) || !validObjectToken(status.Bucket()) {
+		return nil, fmt.Errorf("%w: invalid object store status", errObjectIntegrity)
+	}
+	resolved, err := s.resolveObjectInfo(ctx, s.obj, status.Bucket(), key, make(map[string]struct{}), 0)
 	if err != nil {
 		if errors.Is(err, jetstream.ErrObjectNotFound) {
 			return nil, errObjNotFound
 		}
 		return nil, err
 	}
+	info := resolved.info
 	digest, err := jetstream.DecodeObjectDigest(info.Digest)
 	if err != nil || len(digest) != sha256.Size {
 		return nil, fmt.Errorf("%w: invalid digest", errObjectIntegrity)
@@ -337,21 +345,24 @@ func (s *jetStreamObjectSeam) get(ctx context.Context, key string) (io.ReadClose
 		r.stopCaller = func() bool { return true }
 		return r, nil
 	}
-	if info.Size == 0 || !validObjectToken(info.Bucket) || !validObjectToken(info.NUID) {
+	if info.Size == 0 || !validObjectToken(info.NUID) {
 		return nil, fmt.Errorf("%w: invalid chunk metadata", errObjectIntegrity)
 	}
-	r.stream = objectStreamPrefix + info.Bucket
-	r.subject = objectChunkPrefix + info.Bucket + objectChunkMarker + info.NUID
-	consumer, err := s.js.OrderedConsumer(ctx, r.stream, jetstream.OrderedConsumerConfig{
-		FilterSubjects:    []string{r.subject},
+	r.stream = objectStreamPrefix + resolved.bucket
+	r.subject = objectChunkPrefix + resolved.bucket + objectChunkMarker + info.NUID
+	consumer, err := s.js.CreateConsumer(ctx, r.stream, jetstream.ConsumerConfig{
+		AckPolicy:         jetstream.AckNonePolicy,
+		FilterSubject:     r.subject,
 		DeliverPolicy:     jetstream.DeliverAllPolicy,
 		InactiveThreshold: blobReaderCloseBound,
+		MemoryStorage:     true,
+		MaxRequestBatch:   1,
 	})
 	if err != nil {
 		return nil, err
 	}
 	if isNilInterface(consumer) {
-		return nil, fmt.Errorf("%w: nil ordered consumer", errObjectIntegrity)
+		return nil, fmt.Errorf("%w: nil pull consumer", errObjectIntegrity)
 	}
 	messages, err := consumer.Messages(jetstream.PullMaxMessages(1))
 	if err != nil {
@@ -365,17 +376,25 @@ func (s *jetStreamObjectSeam) get(ctx context.Context, key string) (io.ReadClose
 	return r, nil
 }
 
-func (s *jetStreamObjectSeam) resolveObjectInfo(ctx context.Context, obj jetstream.ObjectStore, key string, seen map[string]struct{}, depth int) (*jetstream.ObjectInfo, error) {
+type resolvedObjectInfo struct {
+	info   *jetstream.ObjectInfo
+	bucket string
+}
+
+func (s *jetStreamObjectSeam) resolveObjectInfo(ctx context.Context, obj jetstream.ObjectStore, bucket, key string, seen map[string]struct{}, depth int) (resolvedObjectInfo, error) {
 	if depth >= objectLinkMaxDepth {
-		return nil, fmt.Errorf("%w: object link depth exceeded", errObjectIntegrity)
+		return resolvedObjectInfo{}, fmt.Errorf("%w: object link depth exceeded", errObjectIntegrity)
 	}
 	info, err := obj.GetInfo(ctx, key)
 	if err != nil {
-		return nil, err
+		return resolvedObjectInfo{}, err
 	}
-	identity := info.Bucket + "\x00" + info.Name
+	if info == nil {
+		return resolvedObjectInfo{}, fmt.Errorf("%w: nil object info", errObjectIntegrity)
+	}
+	identity := bucket + "\x00" + key
 	if _, exists := seen[identity]; exists {
-		return nil, fmt.Errorf("%w: object link cycle", errObjectIntegrity)
+		return resolvedObjectInfo{}, fmt.Errorf("%w: object link cycle", errObjectIntegrity)
 	}
 	seen[identity] = struct{}{}
 	link := (*jetstream.ObjectLink)(nil)
@@ -383,19 +402,19 @@ func (s *jetStreamObjectSeam) resolveObjectInfo(ctx context.Context, obj jetstre
 		link = info.Opts.Link
 	}
 	if link == nil {
-		return info, nil
+		return resolvedObjectInfo{info: info, bucket: bucket}, nil
 	}
-	if link.Name == "" {
-		return nil, jetstream.ErrCantGetBucket
+	if link.Name == "" || !validObjectToken(link.Bucket) {
+		return resolvedObjectInfo{}, jetstream.ErrCantGetBucket
 	}
 	target := obj
-	if link.Bucket != info.Bucket {
+	if link.Bucket != bucket {
 		target, err = s.js.ObjectStore(ctx, link.Bucket)
 		if err != nil {
-			return nil, err
+			return resolvedObjectInfo{}, err
 		}
 	}
-	return s.resolveObjectInfo(ctx, target, link.Name, seen, depth+1)
+	return s.resolveObjectInfo(ctx, target, link.Bucket, link.Name, seen, depth+1)
 }
 
 func validObjectToken(value string) bool {
@@ -470,7 +489,7 @@ func (r *objectChunkReader) Read(p []byte) (int, error) {
 	}
 	nextChunk := r.chunks + 1
 	wantPending := uint64(r.expectedChunks - nextChunk)
-	if msg.Subject() != r.subject || meta.Stream != r.stream || meta.Sequence.Consumer != uint64(nextChunk) || meta.Sequence.Stream <= r.lastStreamSeq || meta.NumPending != wantPending {
+	if msg.Subject() != r.subject || meta.Stream != r.stream || meta.Sequence.Stream <= r.lastStreamSeq || meta.NumPending != wantPending {
 		return 0, r.fail(fmt.Errorf("%w: invalid chunk order", errObjectIntegrity))
 	}
 	data := msg.Data()
@@ -498,12 +517,14 @@ func (r *objectChunkReader) finish() error {
 		return r.fail(jetstream.ErrDigestMismatch)
 	}
 	r.terminal = io.EOF
+	r.stop()
 	r.stopMessages()
 	return io.EOF
 }
 
 func (r *objectChunkReader) fail(err error) error {
 	r.terminal = err
+	r.stop()
 	r.stopMessages()
 	return err
 }

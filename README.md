@@ -76,9 +76,10 @@ result to repeated or concurrent callers. After Close returns, later Reads
 return no bytes and `fs.ErrClosed`; a successful Get never returns a literal or
 typed-nil reader.
 
-The provider owns an ordered, exact-subject pull consumer for each non-empty
+The provider owns an ephemeral, exact-subject pull consumer for each non-empty
 object reader. Every blocked chunk fetch has a five-second ceiling, while a
 reader that continues making progress has no absolute lifetime. The provider
+uses AckNone, in-memory consumer state, and no client-side auto-reset path, then
 advertises a conservative six-second shutdown bound. Composition code can
 discover it without depending on a newer Storage contract:
 

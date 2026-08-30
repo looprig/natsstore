@@ -91,7 +91,7 @@ const (
 
 // BlobReaderCloseBound reports the maximum time a reader returned by Get may
 // take to stop an active provider-controlled Read and return from Close. The
-// provider bounds each ordered-consumer chunk fetch at five seconds; the extra
+// provider bounds each ephemeral pull-consumer chunk fetch at five seconds; the extra
 // second covers cancellation and local close completion.
 func (*blobStore) BlobReaderCloseBound() time.Duration {
 	return blobReaderCloseBound

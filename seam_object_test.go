@@ -36,11 +36,99 @@ func TestObjectChunkReaderStreamsAndVerifies(t *testing.T) {
 	if err != nil || !bytes.Equal(got, data) {
 		t.Fatalf("ReadAll = %q, %v; want %q", got, err, data)
 	}
-	if manager.stream != "OBJ_B" || manager.cfg.FilterSubjects[0] != "$O.B.C.N" || manager.cfg.DeliverPolicy != jetstream.DeliverAllPolicy || manager.cfg.InactiveThreshold != blobReaderCloseBound || manager.messageOpts != 1 || manager.pullMaxMessages != 1 {
+	if manager.stream != "OBJ_B" || manager.cfg.FilterSubject != "$O.B.C.N" || manager.cfg.AckPolicy != jetstream.AckNonePolicy || manager.cfg.DeliverPolicy != jetstream.DeliverAllPolicy || !manager.cfg.MemoryStorage || manager.cfg.InactiveThreshold != blobReaderCloseBound || manager.cfg.MaxRequestBatch != 1 || manager.messageOpts != 1 || manager.pullMaxMessages != 1 {
 		t.Fatalf("consumer = stream %q config %#v opts %d pull max %d", manager.stream, manager.cfg, manager.messageOpts, manager.pullMaxMessages)
 	}
 	if calls := messages.stopCalls.Load(); calls != 1 {
 		t.Fatalf("Messages.Stop calls = %d, want 1", calls)
+	}
+}
+
+func TestObjectChunkReaderUsesQueriedBucketInsteadOfObjectInfoBucket(t *testing.T) {
+	t.Parallel()
+	data := []byte("payload")
+	digest := sha256.Sum256(data)
+	messages := newFakeObjectMessages(fakeObjectMsg("$O.TRUSTED.C.N", "OBJ_TRUSTED", 9, 10, 0, data))
+	manager := &fakeObjectConsumerManager{consumer: &fakeObjectConsumer{messages: messages}}
+	store := &fakeInfoObjectStore{
+		bucket: "TRUSTED",
+		infos:  map[string]*jetstream.ObjectInfo{"blob": objectInfo("SPOOFED", "blob", "N", 1, uint64(len(data)), digest[:])},
+	}
+	reader, err := newJetStreamObjectSeam(store, manager).get(context.Background(), "blob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(reader)
+	if err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("ReadAll = %q, %v; want %q", got, err, data)
+	}
+	if manager.stream != "OBJ_TRUSTED" || manager.cfg.FilterSubject != "$O.TRUSTED.C.N" {
+		t.Fatalf("consumer routed using untrusted metadata: stream %q filter %q", manager.stream, manager.cfg.FilterSubject)
+	}
+}
+
+func TestObjectChunkReaderBindsResolvedLinkTargetBucket(t *testing.T) {
+	t.Parallel()
+	data := []byte("linked")
+	digest := sha256.Sum256(data)
+	target := &fakeInfoObjectStore{
+		bucket: "IGNORED_STATUS",
+		infos:  map[string]*jetstream.ObjectInfo{"target": objectInfo("SPOOFED", "target", "N", 1, uint64(len(data)), digest[:])},
+	}
+	root := &fakeInfoObjectStore{
+		bucket: "ROOT",
+		infos: map[string]*jetstream.ObjectInfo{
+			"link": {Bucket: "SPOOFED_ROOT", ObjectMeta: jetstream.ObjectMeta{Name: "link", Opts: &jetstream.ObjectMetaOptions{Link: &jetstream.ObjectLink{Bucket: "TARGET", Name: "target"}}}},
+		},
+	}
+	messages := newFakeObjectMessages(fakeObjectMsg("$O.TARGET.C.N", "OBJ_TARGET", 3, 10, 0, data))
+	manager := &fakeObjectConsumerManager{stores: map[string]jetstream.ObjectStore{"TARGET": target}, consumer: &fakeObjectConsumer{messages: messages}}
+	reader, err := newJetStreamObjectSeam(root, manager).get(context.Background(), "link")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(reader)
+	if err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("ReadAll = %q, %v; want %q", got, err, data)
+	}
+	if manager.stream != "OBJ_TARGET" || manager.cfg.FilterSubject != "$O.TARGET.C.N" {
+		t.Fatalf("linked consumer routed outside resolved target: stream %q filter %q", manager.stream, manager.cfg.FilterSubject)
+	}
+}
+
+func TestObjectChunkReaderUnregistersCallerAfterFuncAtTerminalResult(t *testing.T) {
+	t.Parallel()
+	data := []byte("payload")
+	digest := sha256.Sum256(data)
+	for _, tt := range []struct {
+		name   string
+		digest []byte
+	}{
+		{name: "EOF", digest: digest[:]},
+		{name: "failure", digest: make([]byte, sha256.Size)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			messages := newFakeObjectMessages(fakeObjectMsg("$O.B.C.N", "OBJ_B", 4, 10, 0, data))
+			var unregisterCalls atomic.Int32
+			reader := &objectChunkReader{
+				callerCtx:      context.Background(),
+				messages:       messages,
+				stream:         "OBJ_B",
+				subject:        "$O.B.C.N",
+				expectedChunks: 1,
+				expectedSize:   uint64(len(data)),
+				expectedDigest: tt.digest,
+				hash:           sha256.New(),
+				stopCaller: func() bool {
+					unregisterCalls.Add(1)
+					return true
+				},
+			}
+			_, _ = io.ReadAll(reader)
+			if got := unregisterCalls.Load(); got != 1 {
+				t.Fatalf("caller AfterFunc unregister calls = %d, want 1", got)
+			}
+		})
 	}
 }
 
@@ -57,7 +145,6 @@ func TestObjectChunkReaderRejectsIntegrityViolations(t *testing.T) {
 		{name: "malformed digest", info: &jetstream.ObjectInfo{Bucket: "B", NUID: "N", Chunks: 1, Size: 7, Digest: "bad", ObjectMeta: jetstream.ObjectMeta{Name: "blob"}}},
 		{name: "wrong subject", info: objectInfo("B", "blob", "N", 1, 7, digest[:]), msg: fakeObjectMsg("$O.B.C.X", "OBJ_B", 1, 1, 0, data)},
 		{name: "wrong stream", info: objectInfo("B", "blob", "N", 1, 7, digest[:]), msg: fakeObjectMsg("$O.B.C.N", "OBJ_X", 1, 1, 0, data)},
-		{name: "wrong consumer order", info: objectInfo("B", "blob", "N", 1, 7, digest[:]), msg: fakeObjectMsg("$O.B.C.N", "OBJ_B", 2, 1, 0, data)},
 		{name: "unexpected pending", info: objectInfo("B", "blob", "N", 1, 7, digest[:]), msg: fakeObjectMsg("$O.B.C.N", "OBJ_B", 1, 1, 1, data)},
 		{name: "oversize", info: objectInfo("B", "blob", "N", 1, 6, digest[:]), msg: fakeObjectMsg("$O.B.C.N", "OBJ_B", 1, 1, 0, data)},
 		{name: "undersize", info: objectInfo("B", "blob", "N", 1, 8, digest[:]), msg: fakeObjectMsg("$O.B.C.N", "OBJ_B", 1, 1, 0, data)},
@@ -77,6 +164,26 @@ func TestObjectChunkReaderRejectsIntegrityViolations(t *testing.T) {
 	}
 }
 
+func TestObjectChunkReaderRejectsNonIncreasingStreamSequence(t *testing.T) {
+	t.Parallel()
+	data := []byte("ab")
+	digest := sha256.Sum256(data)
+	messages := newFakeObjectMessages(
+		fakeObjectMsg("$O.B.C.N", "OBJ_B", 7, 10, 1, data[:1]),
+		fakeObjectMsg("$O.B.C.N", "OBJ_B", 9, 10, 0, data[1:]),
+	)
+	manager := &fakeObjectConsumerManager{consumer: &fakeObjectConsumer{messages: messages}}
+	reader, err := newJetStreamObjectSeam(&fakeInfoObjectStore{infos: map[string]*jetstream.ObjectInfo{
+		"blob": objectInfo("B", "blob", "N", 2, uint64(len(data)), digest[:]),
+	}}, manager).get(context.Background(), "blob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(reader); !errors.Is(err, errObjectIntegrity) {
+		t.Fatalf("ReadAll error = %v, want integrity failure", err)
+	}
+}
+
 func TestObjectChunkReaderEmptyAndLinks(t *testing.T) {
 	t.Parallel()
 	emptyDigest := sha256.Sum256(nil)
@@ -92,8 +199,8 @@ func TestObjectChunkReaderEmptyAndLinks(t *testing.T) {
 	if data, readErr := io.ReadAll(reader); readErr != nil || len(data) != 0 {
 		t.Fatalf("empty linked object = %q, %v", data, readErr)
 	}
-	if manager.orderedCalls != 0 {
-		t.Fatalf("empty object created %d consumers", manager.orderedCalls)
+	if manager.createCalls != 0 {
+		t.Fatalf("empty object created %d consumers", manager.createCalls)
 	}
 	root.infos["bucket-link"] = &jetstream.ObjectInfo{Bucket: "R", ObjectMeta: jetstream.ObjectMeta{Name: "bucket-link", Opts: &jetstream.ObjectMetaOptions{Link: &jetstream.ObjectLink{Bucket: "T"}}}}
 	if _, err := newJetStreamObjectSeam(root, manager).get(context.Background(), "bucket-link"); !errors.Is(err, jetstream.ErrCantGetBucket) {
@@ -214,7 +321,8 @@ func objectInfo(bucket, name, nuid string, chunks uint32, size uint64, digest []
 
 type fakeInfoObjectStore struct {
 	jetstream.ObjectStore
-	infos map[string]*jetstream.ObjectInfo
+	bucket string
+	infos  map[string]*jetstream.ObjectInfo
 }
 
 type fixedConsumerManager struct{ consumer jetstream.Consumer }
@@ -222,7 +330,7 @@ type fixedConsumerManager struct{ consumer jetstream.Consumer }
 func (*fixedConsumerManager) ObjectStore(context.Context, string) (jetstream.ObjectStore, error) {
 	return nil, jetstream.ErrBucketNotFound
 }
-func (m *fixedConsumerManager) OrderedConsumer(context.Context, string, jetstream.OrderedConsumerConfig) (jetstream.Consumer, error) {
+func (m *fixedConsumerManager) CreateConsumer(context.Context, string, jetstream.ConsumerConfig) (jetstream.Consumer, error) {
 	return m.consumer, nil
 }
 
@@ -243,12 +351,30 @@ func (s *fakeInfoObjectStore) GetInfo(_ context.Context, name string, _ ...jetst
 	return info, nil
 }
 
+func (s *fakeInfoObjectStore) Status(context.Context) (jetstream.ObjectStoreStatus, error) {
+	bucket := s.bucket
+	if bucket == "" {
+		for _, info := range s.infos {
+			bucket = info.Bucket
+			break
+		}
+	}
+	return &fakeObjectStoreStatus{bucket: bucket}, nil
+}
+
+type fakeObjectStoreStatus struct {
+	jetstream.ObjectStoreStatus
+	bucket string
+}
+
+func (s *fakeObjectStoreStatus) Bucket() string { return s.bucket }
+
 type fakeObjectConsumerManager struct {
-	stores                                     map[string]jetstream.ObjectStore
-	consumer                                   *fakeObjectConsumer
-	stream                                     string
-	cfg                                        jetstream.OrderedConsumerConfig
-	messageOpts, pullMaxMessages, orderedCalls int
+	stores                                    map[string]jetstream.ObjectStore
+	consumer                                  *fakeObjectConsumer
+	stream                                    string
+	cfg                                       jetstream.ConsumerConfig
+	messageOpts, pullMaxMessages, createCalls int
 }
 
 func (m *fakeObjectConsumerManager) ObjectStore(_ context.Context, bucket string) (jetstream.ObjectStore, error) {
@@ -258,9 +384,9 @@ func (m *fakeObjectConsumerManager) ObjectStore(_ context.Context, bucket string
 	}
 	return store, nil
 }
-func (m *fakeObjectConsumerManager) OrderedConsumer(_ context.Context, stream string, cfg jetstream.OrderedConsumerConfig) (jetstream.Consumer, error) {
+func (m *fakeObjectConsumerManager) CreateConsumer(_ context.Context, stream string, cfg jetstream.ConsumerConfig) (jetstream.Consumer, error) {
 	m.stream, m.cfg = stream, cfg
-	m.orderedCalls++
+	m.createCalls++
 	if m.consumer == nil {
 		m.consumer = &fakeObjectConsumer{messages: newFakeObjectMessages()}
 	}
