@@ -249,9 +249,14 @@ func (s *jetStreamOrderedSeam) ensureStream(ctx context.Context, spec orderedStr
 	return s.verifyAndCacheStream(ctx, spec, stream)
 }
 
-// verifyOrderedStreamConfig checks the properties the ordered design depends on.
-// Anything else about the stream is the operator's business.
+// verifyOrderedStreamConfig checks every provisioned field that the ordered
+// design depends on. Name is already fixed by the named lookup. Description,
+// subjects, retention, discard, storage, deletion limits, per-subject history,
+// the message-size floor, and atomic publish are load-bearing and checked here.
+// More replicas and a larger (or unlimited) message ceiling are safe operational
+// drift; other unprovisioned fields remain the operator's business.
 func verifyOrderedStreamConfig(spec orderedStreamSpec, cfg jetstream.StreamConfig) error {
+	want := orderedStreamConfig(spec)
 	if cfg.Description != orderedStreamDescription {
 		return &OrderedStreamConfigError{
 			Stream: spec.stream,
@@ -273,12 +278,32 @@ func verifyOrderedStreamConfig(spec orderedStreamSpec, cfg jetstream.StreamConfi
 			Reason: "subjects are not exactly " + strconv.Quote(spec.subjectFilter),
 		}
 	}
+	if cfg.Retention != want.Retention {
+		return &OrderedStreamConfigError{
+			Stream: spec.stream,
+			Reason: "retention policy is " + cfg.Retention.String() + ", want " + want.Retention.String() +
+				" (consumers must not remove authoritative records)",
+		}
+	}
+	if cfg.Storage != want.Storage {
+		return &OrderedStreamConfigError{
+			Stream: spec.stream,
+			Reason: "storage is " + cfg.Storage.String() + ", want " + want.Storage.String() +
+				" (ordered records must survive restart)",
+		}
+	}
+	if cfg.MaxMsgSize != -1 && cfg.MaxMsgSize < want.MaxMsgSize {
+		return &OrderedStreamConfigError{
+			Stream: spec.stream,
+			Reason: "max message size is " + strconv.FormatInt(int64(cfg.MaxMsgSize), 10) +
+				", want at least " + strconv.FormatInt(int64(want.MaxMsgSize), 10),
+		}
+	}
 	// Every limit that could delete a record behind the store's back. An ordered
 	// record is the authority for its identity and its order is never reused, so
 	// silent expiry is not a capacity policy — it is corruption: the identity
 	// subject would read absent and the next Create would reallocate an order that
 	// has already been handed out.
-	want := orderedStreamConfig(spec)
 	for _, limit := range []struct {
 		name string
 		got  int64
@@ -299,7 +324,7 @@ func verifyOrderedStreamConfig(spec orderedStreamSpec, cfg jetstream.StreamConfi
 	if cfg.Discard != want.Discard {
 		return &OrderedStreamConfigError{
 			Stream: spec.stream,
-			Reason: "discard policy is not the provisioned one",
+			Reason: "discard policy is " + cfg.Discard.String() + ", want " + want.Discard.String(),
 		}
 	}
 	return nil

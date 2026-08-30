@@ -81,6 +81,10 @@ func TestVerifyOrderedStreamConfigRejectsDrift(t *testing.T) {
 		{name: "byte limit", mutate: func(c *jetstream.StreamConfig) { c.MaxBytes = 1 << 20 }},
 		{name: "message limit", mutate: func(c *jetstream.StreamConfig) { c.MaxMsgs = 1000 }},
 		{name: "discard new", mutate: func(c *jetstream.StreamConfig) { c.Discard = jetstream.DiscardNew }},
+		{name: "work queue retention", mutate: func(c *jetstream.StreamConfig) { c.Retention = jetstream.WorkQueuePolicy }},
+		{name: "interest retention", mutate: func(c *jetstream.StreamConfig) { c.Retention = jetstream.InterestPolicy }},
+		{name: "memory storage", mutate: func(c *jetstream.StreamConfig) { c.Storage = jetstream.MemoryStorage }},
+		{name: "message size below ordered ceiling", mutate: func(c *jetstream.StreamConfig) { c.MaxMsgSize = orderedMaxMsgSize - 1 }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -96,6 +100,45 @@ func TestVerifyOrderedStreamConfigRejectsDrift(t *testing.T) {
 				t.Fatalf("Stream = %q, want %q", configErr.Stream, spec.stream)
 			}
 		})
+	}
+}
+
+func TestVerifyOrderedStreamConfigAllowsSafeOperationalDrift(t *testing.T) {
+	t.Parallel()
+	spec := testOrderedSpec(t)
+	for _, tc := range []struct {
+		name   string
+		mutate func(*jetstream.StreamConfig)
+	}{
+		{name: "more replicas", mutate: func(c *jetstream.StreamConfig) { c.Replicas = 3 }},
+		{name: "larger message ceiling", mutate: func(c *jetstream.StreamConfig) { c.MaxMsgSize++ }},
+		{name: "unlimited message ceiling", mutate: func(c *jetstream.StreamConfig) { c.MaxMsgSize = -1 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := orderedStreamConfig(spec)
+			tc.mutate(&cfg)
+			if err := verifyOrderedStreamConfig(spec, cfg); err != nil {
+				t.Fatalf("verifyOrderedStreamConfig = %v, want accepted safe drift", err)
+			}
+		})
+	}
+}
+
+func TestVerifyOrderedStreamConfigReportsDiscardDrift(t *testing.T) {
+	t.Parallel()
+	spec := testOrderedSpec(t)
+	cfg := orderedStreamConfig(spec)
+	cfg.Discard = jetstream.DiscardNew
+	err := verifyOrderedStreamConfig(spec, cfg)
+	var configErr *OrderedStreamConfigError
+	if !errors.As(err, &configErr) {
+		t.Fatalf("error = %v (%T), want *OrderedStreamConfigError", err, err)
+	}
+	for _, want := range []string{jetstream.DiscardNew.String(), jetstream.DiscardOld.String()} {
+		if !strings.Contains(configErr.Reason, want) {
+			t.Fatalf("Reason = %q, want actual and required policies including %q", configErr.Reason, want)
+		}
 	}
 }
 

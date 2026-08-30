@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -453,6 +454,53 @@ func TestOrderedStoreReadCachesOnlyVerifiedStream(t *testing.T) {
 	}
 	if _, ok := seam.cachedVerifiedStream(spec.stream); !ok {
 		t.Fatal("Get did not cache the successfully verified stream")
+	}
+}
+
+func TestOrderedStoreReadBeforeCreateRejectsLoadBearingStreamDrift(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*jetstream.StreamConfig)
+	}{
+		{name: "work queue retention", mutate: func(c *jetstream.StreamConfig) { c.Retention = jetstream.WorkQueuePolicy }},
+		{name: "memory storage", mutate: func(c *jetstream.StreamConfig) { c.Storage = jetstream.MemoryStorage }},
+		{name: "undersized messages", mutate: func(c *jetstream.StreamConfig) { c.MaxMsgSize = orderedMaxMsgSize - 1 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, seam := newOrderedTestStore(t)
+			ctx := testCtx(t)
+			id := orderedIntegrationID("read-before-create-" + strings.ReplaceAll(tc.name, " ", "-"))
+			spec, _, _, err := orderedLocation(id)
+			if err != nil {
+				t.Fatalf("orderedLocation: %v", err)
+			}
+			cfg := orderedStreamConfig(spec)
+			tc.mutate(&cfg)
+			stream, err := seam.js.CreateStream(ctx, cfg)
+			if err != nil {
+				t.Fatalf("CreateStream(%s): %v", tc.name, err)
+			}
+
+			_, getErr := store.Get(ctx, id)
+			var configErr *OrderedStreamConfigError
+			if !errors.As(getErr, &configErr) {
+				t.Fatalf("Get(absent) = %T %v, want *OrderedStreamConfigError", getErr, getErr)
+			}
+			if _, ok := seam.cachedVerifiedStream(spec.stream); ok {
+				t.Fatal("Get cached a stream with rejected load-bearing drift")
+			}
+			_, created, createErr := store.Create(ctx, id, "catalog/main", []byte("unsafe"), storage.Rank{}, storage.Due{})
+			if created || !errors.As(createErr, &configErr) {
+				t.Fatalf("Create after Get = created %v, err %T %v; want false, *OrderedStreamConfigError", created, createErr, createErr)
+			}
+			info, err := stream.Info(ctx)
+			if err != nil {
+				t.Fatalf("StreamInfo: %v", err)
+			}
+			if info.State.Msgs != 0 {
+				t.Fatalf("rejected stream holds %d messages, want 0", info.State.Msgs)
+			}
+		})
 	}
 }
 
