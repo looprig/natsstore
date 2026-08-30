@@ -117,7 +117,7 @@ type orderedSeam interface {
 	// lastMsgForSubject returns the current message on subject: its stream
 	// sequence and payload, or (0, nil, nil) when the subject — or the whole
 	// stream — has never been written.
-	lastMsgForSubject(ctx context.Context, stream, subject string) (seq uint64, data []byte, err error)
+	lastMsgForSubject(ctx context.Context, spec orderedStreamSpec, subject string) (seq uint64, data []byte, err error)
 	// publish commits one fenced message. It returns errOrderedPrecondition when
 	// the fence fails and errOrderedAmbiguous when the acknowledgement is lost.
 	publish(ctx context.Context, stream string, msg orderedMsg) error
@@ -298,8 +298,8 @@ func orderedLocation(id storage.OrderedID) (spec orderedStreamSpec, counter, rec
 // readRecord returns the current record on subject together with the stream
 // sequence a compare-and-swap must fence on. A missing subject yields ok=false;
 // a present but unreadable or foreign payload is an error, never an absence.
-func (s *orderedStore) readRecord(ctx context.Context, stream, subject string) (rec storage.OrderedRecord, seq uint64, ok bool, err error) {
-	seq, data, err := s.seam.lastMsgForSubject(ctx, stream, subject)
+func (s *orderedStore) readRecord(ctx context.Context, spec orderedStreamSpec, subject string) (rec storage.OrderedRecord, seq uint64, ok bool, err error) {
+	seq, data, err := s.seam.lastMsgForSubject(ctx, spec, subject)
 	if err != nil {
 		return storage.OrderedRecord{}, 0, false, err
 	}
@@ -319,7 +319,7 @@ func (s *orderedStore) Get(ctx context.Context, id storage.OrderedID) (storage.O
 	if err != nil {
 		return storage.OrderedRecord{}, err
 	}
-	rec, _, ok, err := s.readRecord(ctx, spec.stream, recordSubj)
+	rec, _, ok, err := s.readRecord(ctx, spec, recordSubj)
 	if err != nil {
 		return storage.OrderedRecord{}, err
 	}
@@ -343,7 +343,7 @@ func (s *orderedStore) Create(ctx context.Context, id storage.OrderedID, ranking
 	if err := s.seam.ensureStream(ctx, spec); err != nil {
 		return storage.OrderedRecord{}, false, err
 	}
-	existing, _, ok, err := s.readRecord(ctx, spec.stream, recordSubj)
+	existing, _, ok, err := s.readRecord(ctx, spec, recordSubj)
 	if err != nil {
 		return storage.OrderedRecord{}, false, err
 	}
@@ -372,7 +372,7 @@ func (s *orderedStore) Create(ctx context.Context, id storage.OrderedID, ranking
 				return storage.OrderedRecord{}, false, err
 			}
 		}
-		counterSeq, counterData, err := s.seam.lastMsgForSubject(ctx, spec.stream, counterSubj)
+		counterSeq, counterData, err := s.seam.lastMsgForSubject(ctx, spec, counterSubj)
 		if err != nil {
 			return storage.OrderedRecord{}, false, err
 		}
@@ -414,7 +414,7 @@ func (s *orderedStore) Create(ctx context.Context, id storage.OrderedID, ranking
 		case errors.Is(err, errOrderedPrecondition):
 			// Either a concurrent allocator moved the counter or a concurrent
 			// creator claimed this identity. The identity settles it.
-			winner, _, ok, readErr := s.readRecord(ctx, spec.stream, recordSubj)
+			winner, _, ok, readErr := s.readRecord(ctx, spec, recordSubj)
 			if readErr != nil {
 				return storage.OrderedRecord{}, false, readErr
 			}
@@ -422,7 +422,7 @@ func (s *orderedStore) Create(ctx context.Context, id storage.OrderedID, ranking
 				return winner, false, nil
 			}
 		case errors.Is(err, errOrderedAmbiguous):
-			winner, _, ok, readErr := s.readRecord(ctx, spec.stream, recordSubj)
+			winner, _, ok, readErr := s.readRecord(ctx, spec, recordSubj)
 			if readErr != nil {
 				return storage.OrderedRecord{}, false, readErr
 			}
@@ -456,7 +456,7 @@ func (s *orderedStore) Update(ctx context.Context, id storage.OrderedID, expecte
 	if err != nil {
 		return storage.OrderedRecord{}, err
 	}
-	current, seq, ok, err := s.readRecord(ctx, spec.stream, recordSubj)
+	current, seq, ok, err := s.readRecord(ctx, spec, recordSubj)
 	if err != nil {
 		return storage.OrderedRecord{}, err
 	}
@@ -485,7 +485,7 @@ func (s *orderedStore) Update(ctx context.Context, id storage.OrderedID, expecte
 	next.Value = value
 	next.Rank = rank
 	next.Due = due
-	return s.commitRevision(ctx, spec.stream, recordSubj, seq, next, expectedRevision, storage.OrderedUpdateOperation)
+	return s.commitRevision(ctx, spec, recordSubj, seq, next, expectedRevision, storage.OrderedUpdateOperation)
 }
 
 // Delete writes a logical tombstone: unranked, not due, value and immutable
@@ -497,7 +497,7 @@ func (s *orderedStore) Delete(ctx context.Context, id storage.OrderedID, expecte
 	if err != nil {
 		return storage.OrderedRecord{}, err
 	}
-	current, seq, ok, err := s.readRecord(ctx, spec.stream, recordSubj)
+	current, seq, ok, err := s.readRecord(ctx, spec, recordSubj)
 	if err != nil {
 		return storage.OrderedRecord{}, err
 	}
@@ -520,7 +520,7 @@ func (s *orderedStore) Delete(ctx context.Context, id storage.OrderedID, expecte
 	next.Deleted = true
 	next.Rank = storage.Rank{}
 	next.Due = storage.Due{State: storage.NotDue, UnixMillis: 0}
-	return s.commitRevision(ctx, spec.stream, recordSubj, seq, next, expectedRevision, storage.OrderedDeleteOperation)
+	return s.commitRevision(ctx, spec, recordSubj, seq, next, expectedRevision, storage.OrderedDeleteOperation)
 }
 
 // commitRevision publishes next under the record subject's observed sequence and
@@ -528,19 +528,19 @@ func (s *orderedStore) Delete(ctx context.Context, id storage.OrderedID, expecte
 // which is reported as a revision conflict carrying the observed revision. A lost
 // acknowledgement is resolved by reading the record back: if the stored record IS
 // next, the write landed and succeeds; otherwise the outcome stays ambiguous.
-func (s *orderedStore) commitRevision(ctx context.Context, stream, subject string, expectSeq uint64, next storage.OrderedRecord, expectedRevision uint64, op storage.OrderedOperation) (storage.OrderedRecord, error) {
+func (s *orderedStore) commitRevision(ctx context.Context, spec orderedStreamSpec, subject string, expectSeq uint64, next storage.OrderedRecord, expectedRevision uint64, op storage.OrderedOperation) (storage.OrderedRecord, error) {
 	payload, err := encodeOrderedRecord(next)
 	if err != nil {
 		return storage.OrderedRecord{}, err
 	}
-	err = s.seam.publish(ctx, stream, orderedMsg{subject: subject, data: payload, expectLastSeq: expectSeq})
+	err = s.seam.publish(ctx, spec.stream, orderedMsg{subject: subject, data: payload, expectLastSeq: expectSeq})
 	switch {
 	case err == nil:
 		// As in Create: the returned record must not alias the caller's slice.
 		next.Value = bytes.Clone(next.Value)
 		return next, nil
 	case errors.Is(err, errOrderedPrecondition):
-		current, _, ok, readErr := s.readRecord(ctx, stream, subject)
+		current, _, ok, readErr := s.readRecord(ctx, spec, subject)
 		if readErr != nil {
 			return storage.OrderedRecord{}, readErr
 		}
@@ -562,7 +562,7 @@ func (s *orderedStore) commitRevision(ctx context.Context, stream, subject strin
 			ID: next.ID, ExpectedRevision: expectedRevision, ActualRevision: current.Revision,
 		}
 	case errors.Is(err, errOrderedAmbiguous):
-		current, _, ok, readErr := s.readRecord(ctx, stream, subject)
+		current, _, ok, readErr := s.readRecord(ctx, spec, subject)
 		if readErr != nil {
 			return storage.OrderedRecord{}, readErr
 		}

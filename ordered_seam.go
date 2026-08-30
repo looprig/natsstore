@@ -154,10 +154,10 @@ type orderedBatchAck struct {
 }
 
 // jetStreamOrderedSeam is the production orderedSeam: it binds the ordered
-// store's four operations to a real jetstream.JetStream plus the raw connection
-// the batch protocol needs. It caches the stream handle for each provisioned
-// namespace, so the lazy provisioning check costs one round trip per namespace
-// per process rather than one per mutation.
+// store's operations to a real jetstream.JetStream plus the raw connection the
+// batch protocol needs. Its shared cache contains ONLY handles whose complete
+// ordered layout has been verified, so a cached handle is proof that mutations
+// may use that stream without another Info round trip.
 type jetStreamOrderedSeam struct {
 	nc *nats.Conn
 	js jetstream.JetStream
@@ -167,8 +167,8 @@ type jetStreamOrderedSeam struct {
 	batchNonce string
 	batchID    atomic.Uint64
 
-	mu      sync.RWMutex
-	streams map[string]jetstream.Stream
+	mu              sync.RWMutex
+	verifiedStreams map[string]jetstream.Stream
 }
 
 var _ orderedSeam = (*jetStreamOrderedSeam)(nil)
@@ -178,10 +178,10 @@ var _ orderedSeam = (*jetStreamOrderedSeam)(nil)
 // the legacy nats.JetStreamContext cannot create an AllowAtomicPublish stream.
 func newJetStreamOrderedSeam(nc *nats.Conn, js jetstream.JetStream) *jetStreamOrderedSeam {
 	return &jetStreamOrderedSeam{
-		nc:         nc,
-		js:         js,
-		batchNonce: newOrderedBatchNonce(),
-		streams:    map[string]jetstream.Stream{},
+		nc:              nc,
+		js:              js,
+		batchNonce:      newOrderedBatchNonce(),
+		verifiedStreams: map[string]jetstream.Stream{},
 	}
 }
 
@@ -232,7 +232,7 @@ func orderedStreamConfig(spec orderedStreamSpec) jetstream.StreamConfig {
 // instead of being written into; a stream this process has already verified is
 // served from the handle cache.
 func (s *jetStreamOrderedSeam) ensureStream(ctx context.Context, spec orderedStreamSpec) error {
-	if _, ok := s.cachedStream(spec.stream); ok {
+	if _, ok := s.cachedVerifiedStream(spec.stream); ok {
 		return nil
 	}
 	stream, err := s.js.Stream(ctx, spec.stream)
@@ -246,15 +246,7 @@ func (s *jetStreamOrderedSeam) ensureStream(ctx context.Context, spec orderedStr
 	if err != nil {
 		return &OrderedStreamOpError{Stream: spec.stream, Op: "ensure", Cause: err}
 	}
-	info, err := stream.Info(ctx)
-	if err != nil {
-		return &OrderedStreamOpError{Stream: spec.stream, Op: "info", Cause: err}
-	}
-	if err := verifyOrderedStreamConfig(spec, info.Config); err != nil {
-		return err
-	}
-	s.cacheStream(spec.stream, stream)
-	return nil
+	return s.verifyAndCacheStream(ctx, spec, stream)
 }
 
 // verifyOrderedStreamConfig checks the properties the ordered design depends on.
@@ -313,47 +305,62 @@ func verifyOrderedStreamConfig(spec orderedStreamSpec, cfg jetstream.StreamConfi
 	return nil
 }
 
-func (s *jetStreamOrderedSeam) cachedStream(name string) (jetstream.Stream, bool) {
+func (s *jetStreamOrderedSeam) cachedVerifiedStream(name string) (jetstream.Stream, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	stream, ok := s.streams[name]
+	stream, ok := s.verifiedStreams[name]
 	return stream, ok
 }
 
-func (s *jetStreamOrderedSeam) cacheStream(name string, stream jetstream.Stream) {
+// cacheVerifiedStream publishes a handle only after verifyAndCacheStream has
+// accepted its current layout. Tests may use it directly to pin the invariant
+// that a cached handle needs no further backend access.
+func (s *jetStreamOrderedSeam) cacheVerifiedStream(name string, stream jetstream.Stream) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.streams[name] = stream
+	s.verifiedStreams[name] = stream
+}
+
+// verifyAndCacheStream is the sole production cache-admission path. Info runs
+// before publication, never on a shared cached handle; every later cached read
+// therefore inherits the verified-layout proof without racing get-message state.
+func (s *jetStreamOrderedSeam) verifyAndCacheStream(ctx context.Context, spec orderedStreamSpec, stream jetstream.Stream) error {
+	info, err := stream.Info(ctx)
+	if err != nil {
+		return &OrderedStreamOpError{Stream: spec.stream, Op: "info", Cause: err}
+	}
+	if err := verifyOrderedStreamConfig(spec, info.Config); err != nil {
+		return err
+	}
+	s.cacheVerifiedStream(spec.stream, stream)
+	return nil
 }
 
 // lastMsgForSubject returns the current message on subject. An absent stream and
 // an absent subject are both reported as sequence 0 with no error, which is
 // exactly the value the expected-last-subject-sequence fence uses to mean "must
 // not exist", so a read and the following write agree by construction.
-func (s *jetStreamOrderedSeam) lastMsgForSubject(ctx context.Context, streamName, subject string) (uint64, []byte, error) {
-	stream, ok := s.cachedStream(streamName)
+func (s *jetStreamOrderedSeam) lastMsgForSubject(ctx context.Context, spec orderedStreamSpec, subject string) (uint64, []byte, error) {
+	stream, ok := s.cachedVerifiedStream(spec.stream)
 	if !ok {
 		var err error
-		stream, err = s.js.Stream(ctx, streamName)
+		stream, err = s.js.Stream(ctx, spec.stream)
 		if errors.Is(err, jetstream.ErrStreamNotFound) {
 			return 0, nil, nil
 		}
 		if err != nil {
-			return 0, nil, &OrderedStreamOpError{Stream: streamName, Op: "lookup", Cause: err}
+			return 0, nil, &OrderedStreamOpError{Stream: spec.stream, Op: "lookup", Cause: err}
 		}
-		// Cache the handle. A read-only process never calls ensureStream, so
-		// without this every Get pays a lookup round trip forever — and the view
-		// hydration this store exists to feed is exactly that workload. It is as
-		// safe as the uncached path: the handle is a name binding, and a stream
-		// replaced underneath it fails the same way either way.
-		s.cacheStream(streamName, stream)
+		if err := s.verifyAndCacheStream(ctx, spec, stream); err != nil {
+			return 0, nil, err
+		}
 	}
 	msg, err := stream.GetLastMsgForSubject(ctx, subject)
 	if errors.Is(err, jetstream.ErrMsgNotFound) {
 		return 0, nil, nil
 	}
 	if err != nil {
-		return 0, nil, &OrderedStreamOpError{Stream: streamName, Op: "get last message", Cause: err}
+		return 0, nil, &OrderedStreamOpError{Stream: spec.stream, Op: "get last message", Cause: err}
 	}
 	return msg.Sequence, msg.Data, nil
 }

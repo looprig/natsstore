@@ -4,8 +4,10 @@ package natsstore
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"sync"
 	"testing"
@@ -188,7 +190,7 @@ func TestOrderedStoreForgedPayloadFailsClosedOnServer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("orderedLocation: %v", err)
 	}
-	seq, _, err := seam.lastMsgForSubject(ctx, spec.stream, victimSubj)
+	seq, _, err := seam.lastMsgForSubject(ctx, spec, victimSubj)
 	if err != nil {
 		t.Fatalf("lastMsgForSubject: %v", err)
 	}
@@ -325,6 +327,164 @@ func TestOrderedStoreRejectsForeignStream(t *testing.T) {
 	}
 	if configErr.Stream != spec.stream {
 		t.Fatalf("Stream = %q, want %q", configErr.Stream, spec.stream)
+	}
+}
+
+// TestOrderedStoreReadBeforeMutationStillRejectsUnsafeStream reproduces the
+// cache-poisoning sequence: a read resolves an existing stream before a later
+// mutation. No read may turn a foreign or expiring handle into a trusted cache
+// entry, and Update/Delete must inherit the same layout gate as Create.
+func TestOrderedStoreReadBeforeMutationStillRejectsUnsafeStream(t *testing.T) {
+	t.Run("Get absent then Create rejects expiring stream", func(t *testing.T) {
+		store, seam := newOrderedTestStore(t)
+		ctx := testCtx(t)
+		id := orderedIntegrationID("read-before-create")
+		spec, _, _, err := orderedLocation(id)
+		if err != nil {
+			t.Fatalf("orderedLocation: %v", err)
+		}
+		cfg := orderedStreamConfig(spec)
+		cfg.MaxAge = time.Hour
+		stream, err := seam.js.CreateStream(ctx, cfg)
+		if err != nil {
+			t.Fatalf("CreateStream(expiring): %v", err)
+		}
+		_, getErr := store.Get(ctx, id)
+		var configErr *OrderedStreamConfigError
+		if !errors.As(getErr, &configErr) {
+			t.Fatalf("Get(absent) = %T %v, want *OrderedStreamConfigError", getErr, getErr)
+		}
+		if _, ok := seam.cachedVerifiedStream(spec.stream); ok {
+			t.Fatal("Get cached a rejected expiring stream")
+		}
+		_, created, err := store.Create(ctx, id, "catalog/main", []byte("unsafe"), storage.Rank{}, storage.Due{})
+		if created || !errors.As(err, &configErr) {
+			t.Fatalf("Create after Get = created %v, err %T %v; want false, *OrderedStreamConfigError", created, err, err)
+		}
+		info, err := stream.Info(ctx)
+		if err != nil {
+			t.Fatalf("StreamInfo: %v", err)
+		}
+		if info.State.Msgs != 0 {
+			t.Fatalf("unsafe stream holds %d messages after rejected Create, want 0", info.State.Msgs)
+		}
+	})
+
+	t.Run("Get existing then Update rejects foreign layout", func(t *testing.T) {
+		store, seam := newOrderedTestStore(t)
+		ctx := testCtx(t)
+		id := orderedIntegrationID("read-before-update")
+		spec, _, subject, err := orderedLocation(id)
+		if err != nil {
+			t.Fatalf("orderedLocation: %v", err)
+		}
+		cfg := orderedStreamConfig(spec)
+		cfg.Description = "foreign-layout"
+		if _, err := seam.js.CreateStream(ctx, cfg); err != nil {
+			t.Fatalf("CreateStream(foreign): %v", err)
+		}
+		seedUnsafeOrderedRecord(t, ctx, seam, subject, id)
+		got, getErr := store.Get(ctx, id)
+		var configErr *OrderedStreamConfigError
+		if !errors.As(getErr, &configErr) {
+			t.Fatalf("Get(existing) = (%+v, %T %v), want zero record and *OrderedStreamConfigError", got, getErr, getErr)
+		}
+		if !reflect.DeepEqual(got, storage.OrderedRecord{}) {
+			t.Fatalf("Get(existing) returned unsafe record %+v", got)
+		}
+		if _, ok := seam.cachedVerifiedStream(spec.stream); ok {
+			t.Fatal("Get cached a rejected foreign-layout stream")
+		}
+		_, err = store.Update(ctx, id, 1, []byte("mutated"), storage.Rank{}, storage.Due{})
+		if !errors.As(err, &configErr) {
+			t.Fatalf("Update after Get = %T %v, want *OrderedStreamConfigError", err, err)
+		}
+		assertUnsafeRecordUnchanged(t, ctx, seam, spec.stream, subject, 1, false)
+	})
+
+	t.Run("Get existing then Delete rejects history-retaining stream", func(t *testing.T) {
+		store, seam := newOrderedTestStore(t)
+		ctx := testCtx(t)
+		id := orderedIntegrationID("read-before-delete")
+		spec, _, subject, err := orderedLocation(id)
+		if err != nil {
+			t.Fatalf("orderedLocation: %v", err)
+		}
+		cfg := orderedStreamConfig(spec)
+		cfg.MaxMsgsPerSubject = 2
+		if _, err := seam.js.CreateStream(ctx, cfg); err != nil {
+			t.Fatalf("CreateStream(history-retaining): %v", err)
+		}
+		seedUnsafeOrderedRecord(t, ctx, seam, subject, id)
+		got, getErr := store.Get(ctx, id)
+		var configErr *OrderedStreamConfigError
+		if !errors.As(getErr, &configErr) {
+			t.Fatalf("Get(existing) = (%+v, %T %v), want zero record and *OrderedStreamConfigError", got, getErr, getErr)
+		}
+		if !reflect.DeepEqual(got, storage.OrderedRecord{}) {
+			t.Fatalf("Get(existing) returned unsafe record %+v", got)
+		}
+		if _, ok := seam.cachedVerifiedStream(spec.stream); ok {
+			t.Fatal("Get cached a rejected history-retaining stream")
+		}
+		_, err = store.Delete(ctx, id, 1)
+		if !errors.As(err, &configErr) {
+			t.Fatalf("Delete after Get = %T %v, want *OrderedStreamConfigError", err, err)
+		}
+		assertUnsafeRecordUnchanged(t, ctx, seam, spec.stream, subject, 1, false)
+	})
+}
+
+func TestOrderedStoreReadCachesOnlyVerifiedStream(t *testing.T) {
+	store, seam := newOrderedTestStore(t)
+	ctx := testCtx(t)
+	id := orderedIntegrationID("verified-read-cache")
+	spec, _, _, err := orderedLocation(id)
+	if err != nil {
+		t.Fatalf("orderedLocation: %v", err)
+	}
+	if _, err := seam.js.CreateStream(ctx, orderedStreamConfig(spec)); err != nil {
+		t.Fatalf("CreateStream: %v", err)
+	}
+	_, err = store.Get(ctx, id)
+	var notFound *storage.OrderedRecordNotFoundError
+	if !errors.As(err, &notFound) {
+		t.Fatalf("Get(absent) = %T %v, want *storage.OrderedRecordNotFoundError", err, err)
+	}
+	if _, ok := seam.cachedVerifiedStream(spec.stream); !ok {
+		t.Fatal("Get did not cache the successfully verified stream")
+	}
+}
+
+func seedUnsafeOrderedRecord(t *testing.T, ctx context.Context, seam *jetStreamOrderedSeam, subject string, id storage.OrderedID) {
+	t.Helper()
+	payload, err := encodeOrderedRecord(storage.OrderedRecord{
+		ID: id, RankingScope: "catalog/main", Revision: 1, Order: 1, Value: []byte("original"),
+	})
+	if err != nil {
+		t.Fatalf("encodeOrderedRecord: %v", err)
+	}
+	if _, err := seam.js.Publish(ctx, subject, payload); err != nil {
+		t.Fatalf("seed record: %v", err)
+	}
+}
+
+func assertUnsafeRecordUnchanged(t *testing.T, ctx context.Context, seam *jetStreamOrderedSeam, streamName, subject string, revision uint64, deleted bool) {
+	t.Helper()
+	stream, err := seam.js.Stream(ctx, streamName)
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	msg, err := stream.GetLastMsgForSubject(ctx, subject)
+	if err != nil {
+		t.Fatalf("GetLastMsgForSubject: %v", err)
+	}
+	record, err := decodeOrderedRecord(subject, msg.Data)
+	if err != nil {
+		t.Fatalf("decodeOrderedRecord: %v", err)
+	}
+	if record.Revision != revision || record.Deleted != deleted || !bytes.Equal(record.Value, []byte("original")) {
+		t.Fatalf("unsafe record mutated to %+v", record)
 	}
 }
 
@@ -484,11 +644,11 @@ func TestOrderedBatchFenceAndRollbackOnServer(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
-	counterSeq, counterData, err := seam.lastMsgForSubject(ctx, spec.stream, counterSubj)
+	counterSeq, counterData, err := seam.lastMsgForSubject(ctx, spec, counterSubj)
 	if err != nil {
 		t.Fatalf("lastMsgForSubject(counter): %v", err)
 	}
-	recordSeq, _, err := seam.lastMsgForSubject(ctx, spec.stream, recordSubj)
+	recordSeq, _, err := seam.lastMsgForSubject(ctx, spec, recordSubj)
 	if err != nil {
 		t.Fatalf("lastMsgForSubject(record): %v", err)
 	}
@@ -511,7 +671,7 @@ func TestOrderedBatchFenceAndRollbackOnServer(t *testing.T) {
 	}
 
 	// All or nothing: the counter member must not have committed either.
-	gotCounterSeq, gotCounterData, err := seam.lastMsgForSubject(ctx, spec.stream, counterSubj)
+	gotCounterSeq, gotCounterData, err := seam.lastMsgForSubject(ctx, spec, counterSubj)
 	if err != nil {
 		t.Fatalf("lastMsgForSubject(counter) after rollback: %v", err)
 	}
@@ -519,7 +679,7 @@ func TestOrderedBatchFenceAndRollbackOnServer(t *testing.T) {
 		t.Fatalf("the counter moved to seq %d %q after a rejected batch; want seq %d %q",
 			gotCounterSeq, gotCounterData, counterSeq, counterData)
 	}
-	gotRecordSeq, _, err := seam.lastMsgForSubject(ctx, spec.stream, recordSubj)
+	gotRecordSeq, _, err := seam.lastMsgForSubject(ctx, spec, recordSubj)
 	if err != nil {
 		t.Fatalf("lastMsgForSubject(record) after rollback: %v", err)
 	}

@@ -165,12 +165,12 @@ func TestOrderedErrorClassification(t *testing.T) {
 func TestJetStreamOrderedSeamStreamCache(t *testing.T) {
 	t.Parallel()
 	seam := newJetStreamOrderedSeam(nil, nil)
-	if _, ok := seam.cachedStream("OI_absent"); ok {
+	if _, ok := seam.cachedVerifiedStream("OI_absent"); ok {
 		t.Fatal("a fresh seam reported a cached stream")
 	}
-	seam.cacheStream("OI_present", nil)
-	if _, ok := seam.cachedStream("OI_present"); !ok {
-		t.Fatal("cacheStream did not record the stream handle")
+	seam.cacheVerifiedStream("OI_present", nil)
+	if _, ok := seam.cachedVerifiedStream("OI_present"); !ok {
+		t.Fatal("cacheVerifiedStream did not record the stream handle")
 	}
 	// ensureStream short-circuits on a cached stream, so it must not touch the
 	// nil jetstream context here.

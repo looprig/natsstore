@@ -75,7 +75,7 @@ func (f *fakeOrderedSeam) ensureStream(_ context.Context, spec orderedStreamSpec
 	return f.ensureErr
 }
 
-func (f *fakeOrderedSeam) lastMsgForSubject(_ context.Context, _ string, subject string) (uint64, []byte, error) {
+func (f *fakeOrderedSeam) lastMsgForSubject(_ context.Context, _ orderedStreamSpec, subject string) (uint64, []byte, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.gets++
