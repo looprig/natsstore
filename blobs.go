@@ -6,7 +6,12 @@ import (
 	"crypto/sha256"
 	"errors"
 	"io"
+	"io/fs"
+	"reflect"
 	"strconv"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/looprig/storage"
 )
@@ -46,6 +51,10 @@ type objSeam interface {
 // store logic and its unit fake stay free of any nats.go dependency.
 var errObjNotFound = errors.New("natsstore: object not found")
 
+// errNilObjectReader is the seam-contract cause for a successful get that did
+// not return a usable reader. blobStore exposes it only through *BlobOpError.
+var errNilObjectReader = errors.New("natsstore: object seam returned nil reader")
+
 // BlobOpError reports a definite failure of a blob operation blobStore performs (read /
 // put / get / delete / list / getInfo) that is NOT one of the expected outcomes (absence,
 // content conflict) — a source-reader fault or a backend fault. It fails closed and names
@@ -72,6 +81,19 @@ func (e *BlobOpError) Unwrap() error { return e.Cause }
 type blobStore struct {
 	seam objSeam
 	localPathReporter
+}
+
+const (
+	blobObjectReadTimeout   = 5 * time.Second
+	blobReaderCloseOverhead = time.Second
+)
+
+// BlobReaderCloseBound reports the maximum time a reader returned by Get may
+// take to stop an active provider-controlled Read and return from Close. The
+// pinned nats.go ObjectResult bounds a Read without a caller deadline at five
+// seconds; the extra second covers cancellation and local close completion.
+func (*blobStore) BlobReaderCloseBound() time.Duration {
+	return blobObjectReadTimeout + blobReaderCloseOverhead
 }
 
 var _ storage.Blobs = (*blobStore)(nil)
@@ -117,8 +139,10 @@ func (s *blobStore) Put(ctx context.Context, key string, r io.Reader) error {
 	return &storage.BlobConflictError{Key: key}
 }
 
-// Get returns an independent reader over the object at key, or *storage.BlobNotFoundError
-// if absent. The caller owns closing the reader. A backend fault is a typed *BlobOpError
+// Get returns an independent lifecycle reader over the object at key, or
+// *storage.BlobNotFoundError if absent. The caller owns closing the reader; Close
+// is concurrent-safe and stable, and later Reads fail with fs.ErrClosed. A backend
+// fault, including a nil reader returned by the seam, is a typed *BlobOpError
 // (fail closed) — never conflated with absence.
 func (s *blobStore) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	k, err := blobKeyForName(key)
@@ -132,7 +156,55 @@ func (s *blobStore) Get(ctx context.Context, key string) (io.ReadCloser, error) 
 		}
 		return nil, &BlobOpError{Key: key, Op: "get", Cause: err}
 	}
-	return rc, nil
+	if isNilReadCloser(rc) {
+		return nil, &BlobOpError{Key: key, Op: "get", Cause: errNilObjectReader}
+	}
+	return newBlobLifecycleReader(rc), nil
+}
+
+func isNilReadCloser(reader io.ReadCloser) bool {
+	if reader == nil {
+		return true
+	}
+	value := reflect.ValueOf(reader)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
+}
+
+// blobLifecycleReader adapts nats.go's streaming ObjectResult to the Blob reader
+// lifecycle. Closure is published before touching the underlying reader, while
+// sync.Once makes concurrent Close calls wait for and return one stable result.
+type blobLifecycleReader struct {
+	underlying io.ReadCloser
+	closed     atomic.Bool
+	closeOnce  sync.Once
+	closeDone  chan struct{}
+	closeErr   error
+}
+
+func newBlobLifecycleReader(underlying io.ReadCloser) *blobLifecycleReader {
+	return &blobLifecycleReader{underlying: underlying, closeDone: make(chan struct{})}
+}
+
+func (r *blobLifecycleReader) Read(p []byte) (int, error) {
+	if r.closed.Load() {
+		return 0, fs.ErrClosed
+	}
+	return r.underlying.Read(p)
+}
+
+func (r *blobLifecycleReader) Close() error {
+	r.closed.Store(true)
+	r.closeOnce.Do(func() {
+		r.closeErr = r.underlying.Close()
+		close(r.closeDone)
+	})
+	<-r.closeDone
+	return r.closeErr
 }
 
 // Delete removes the object at key. It is idempotent: deleting an absent key is a success,

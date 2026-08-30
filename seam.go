@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -286,17 +287,39 @@ func (s *jetStreamObjectSeam) put(ctx context.Context, key string, data []byte) 
 	return err
 }
 
-// get returns an ObjectStore result (an io.ReadCloser that verifies the digest on read),
-// bounded by ctx, or errObjNotFound if absent.
+// get returns an ObjectStore result (an io.ReadCloser that verifies the digest
+// on read), bounded by both ctx and blobObjectReadTimeout, or errObjNotFound if
+// absent. The owned timeout keeps shutdown bounded even when a caller supplies a
+// later deadline; objectReadCloser cancels it when the reader closes sooner.
 func (s *jetStreamObjectSeam) get(ctx context.Context, key string) (io.ReadCloser, error) {
-	res, err := s.obj.Get(ctx, key)
+	readCtx, cancel := context.WithTimeout(ctx, blobObjectReadTimeout)
+	res, err := s.obj.Get(readCtx, key)
 	if err != nil {
+		cancel()
 		if errors.Is(err, jetstream.ErrObjectNotFound) {
 			return nil, errObjNotFound
 		}
 		return nil, err
 	}
-	return res, nil
+	return &objectReadCloser{ReadCloser: res, cancel: cancel}, nil
+}
+
+// objectReadCloser owns the internal timeout context imposed on one streaming
+// ObjectResult. The outer blobLifecycleReader calls Close exactly once, while
+// this guard keeps the seam correct if it is exercised directly in tests.
+type objectReadCloser struct {
+	io.ReadCloser
+	cancel    context.CancelFunc
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func (r *objectReadCloser) Close() error {
+	r.closeOnce.Do(func() {
+		r.cancel()
+		r.closeErr = r.ReadCloser.Close()
+	})
+	return r.closeErr
 }
 
 // delete removes key, bounded by ctx. An absent object surfaces as

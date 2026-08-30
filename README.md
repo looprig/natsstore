@@ -66,6 +66,34 @@ remains a definite typed batch error for the caller to retry; repeated subject-s
 races exhaust the provider's bounded retry budget as `*OrderedContentionError`. Neither
 case silently weakens atomicity or order guarantees.
 
+## Blob reader lifecycle
+
+The planned v0.5.1 release makes each reader returned by `Blobs.Get` safe for
+bounded shutdown while retaining JetStream's streaming ObjectStore path. Close
+publishes closure before touching the ObjectStore result, is safe concurrent
+with Read, calls the underlying Close exactly once, and returns one stable
+result to repeated or concurrent callers. After Close returns, later Reads
+return no bytes and `fs.ErrClosed`; a successful Get never returns a literal or
+typed-nil reader.
+
+The provider caps the pinned nats.go ObjectResult context at five seconds and
+advertises a conservative six-second reader shutdown bound. Composition code
+can discover it without depending on a newer Storage contract:
+
+```go
+type blobReaderLifecycle interface {
+    BlobReaderCloseBound() time.Duration
+}
+
+bound := st.Blobs.(blobReaderLifecycle).BlobReaderCloseBound()
+```
+
+The five-second ObjectResult context also bounds a slow or abandoned streaming
+read; callers should continuously drain a returned reader and use object-level
+retry after a timeout. This is a local compatibility preparation only:
+`go.mod` remains pinned to the published Storage v0.5.0 until a newer contract
+release exists.
+
 ## Dependencies
 
 The NATS dependencies are sanctioned **only in this module** (`github.com/nats-io/nats.go`

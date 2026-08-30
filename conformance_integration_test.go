@@ -5,8 +5,10 @@ package natsstore
 import (
 	"context"
 	"errors"
+	"io"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -232,6 +234,97 @@ func TestBlobsConformance(t *testing.T) {
 	storetest.TestBlobs(t, func(t *testing.T) storage.Blobs {
 		return newBlobsBackend(t, root, &counter)
 	})
+}
+
+// TestBlobReaderCloseBoundWithMissingChunks is the provider-native nonvacuity
+// proof for Blob reader shutdown. It leaves valid object metadata in place but
+// purges the referenced chunks, forcing nats.go's ObjectResult.Read to wait on
+// its network pipe. Close must wait behind that active Read, and both must return
+// within the provider's advertised bound rather than the caller's later deadline.
+func TestBlobReaderCloseBoundWithMissingChunks(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", root)
+	eng, err := OpenEngine(EngineOptions{DataDir: filepath.Join(root, "jetstream"), SyncInterval: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("Open engine: %v", err)
+	}
+	t.Cleanup(func() { _ = eng.Close() })
+	js, err := jetstream.New(eng.Conn())
+	if err != nil {
+		t.Fatalf("jetstream.New: %v", err)
+	}
+
+	const bucket = "blob_close_bound"
+	const key = "blobs/missing-chunks"
+	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
+	defer cancel()
+	obj, err := js.CreateObjectStore(ctx, objectStoreConfig(bucket))
+	if err != nil {
+		t.Fatalf("CreateObjectStore: %v", err)
+	}
+	info, err := obj.Put(ctx, jetstream.ObjectMeta{Name: key}, strings.NewReader("chunk payload"))
+	if err != nil {
+		t.Fatalf("ObjectStore.Put: %v", err)
+	}
+	stream, err := js.Stream(ctx, "OBJ_"+bucket)
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	chunkSubject := "$O." + bucket + ".C." + info.NUID
+	if err := stream.Purge(ctx, jetstream.WithPurgeSubject(chunkSubject)); err != nil {
+		t.Fatalf("Purge chunks: %v", err)
+	}
+
+	store := newBlobStore(newJetStreamObjectSeam(obj))
+	reader, err := store.Get(ctx, key)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	started := make(chan struct{})
+	readDone := make(chan error, 1)
+	go func() {
+		close(started)
+		_, readErr := reader.Read(make([]byte, 1))
+		readDone <- readErr
+	}()
+	<-started
+	blockedWindow := time.NewTimer(100 * time.Millisecond)
+	select {
+	case readErr := <-readDone:
+		blockedWindow.Stop()
+		t.Fatalf("Read returned before Close against missing chunks: %v", readErr)
+	case <-blockedWindow.C:
+	}
+
+	startedAt := time.Now()
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- reader.Close() }()
+	bound := store.BlobReaderCloseBound()
+	deadline := time.NewTimer(bound)
+	defer deadline.Stop()
+	var readErr, closeErr error
+	for readDone != nil || closeDone != nil {
+		select {
+		case readErr = <-readDone:
+			readDone = nil
+		case closeErr = <-closeDone:
+			closeDone = nil
+		case <-deadline.C:
+			t.Fatalf("Read/Close exceeded advertised %v bound", bound)
+		}
+	}
+	elapsed := time.Since(startedAt)
+	if elapsed > bound {
+		t.Fatalf("Read/Close took %v, exceeded advertised %v bound", elapsed, bound)
+	}
+	if readErr == nil || closeErr != nil {
+		t.Fatalf("Read/Close = %v / %v, want terminal Read error and nil Close", readErr, closeErr)
+	}
+	for i := 0; i < 3; i++ {
+		if n, postErr := reader.Read(make([]byte, 1)); n != 0 || postErr == nil || errors.Is(postErr, io.EOF) {
+			t.Fatalf("post-Close Read %d = %d, %v; want non-EOF terminal error", i, n, postErr)
+		}
+	}
 }
 
 // TestLeaserConformance runs the full storage Leaser conformance suite against the

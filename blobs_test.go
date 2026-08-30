@@ -6,8 +6,11 @@ import (
 	"crypto/sha256"
 	"errors"
 	"io"
+	"io/fs"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/looprig/storage"
 )
@@ -433,4 +436,197 @@ func TestBlobsBackendFaultFailsClosed(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestBlobsGetRejectsNilSeamReader(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name   string
+		reader io.ReadCloser
+	}{
+		{name: "literal nil"},
+		{name: "typed nil", reader: (*serializedReadCloser)(nil)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			seam := &scriptedGetObjSeam{fakeObjSeam: newFakeObjSeam(), reader: tt.reader}
+			store := newBlobStore(seam)
+			reader, err := store.Get(context.Background(), "blobs/nil-reader")
+			var opErr *BlobOpError
+			if reader != nil || !errors.As(err, &opErr) || opErr.Op != "get" {
+				t.Fatalf("Get = %v, %T %v; want nil, *BlobOpError(get)", reader, err, err)
+			}
+		})
+	}
+}
+
+func TestBlobReaderLifecycleCloseIsConcurrentAndStable(t *testing.T) {
+	t.Parallel()
+
+	readCause := errors.New("read stopped")
+	closeCause := errors.New("close failed")
+	underlying := newSerializedReadCloser(readCause, closeCause)
+	store := newBlobStore(&scriptedGetObjSeam{fakeObjSeam: newFakeObjSeam(), reader: underlying})
+	reader, err := store.Get(context.Background(), "blobs/lifecycle")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	readDone := make(chan error, 1)
+	go func() {
+		_, readErr := reader.Read(make([]byte, 1))
+		readDone <- readErr
+	}()
+	select {
+	case <-underlying.readStarted:
+	case <-time.After(time.Second):
+		t.Fatal("Read did not enter the underlying reader")
+	}
+
+	const closeCallers = 8
+	closeResults := make(chan error, closeCallers)
+	for range closeCallers {
+		go func() { closeResults <- reader.Close() }()
+	}
+	select {
+	case <-underlying.closeStarted:
+		t.Fatal("underlying Close passed the active Read before it was released")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(underlying.releaseRead)
+
+	select {
+	case readErr := <-readDone:
+		if !errors.Is(readErr, readCause) {
+			t.Fatalf("active Read = %v, want read cause", readErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("active Read did not return")
+	}
+	for range closeCallers {
+		select {
+		case closeErr := <-closeResults:
+			if !errors.Is(closeErr, closeCause) {
+				t.Fatalf("Close = %v, want stable close cause", closeErr)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("concurrent Close did not return")
+		}
+	}
+	if calls := underlying.closeCalls.Load(); calls != 1 {
+		t.Fatalf("underlying Close calls = %d, want 1", calls)
+	}
+	for i := 0; i < 3; i++ {
+		if n, readErr := reader.Read(make([]byte, 1)); n != 0 || !errors.Is(readErr, fs.ErrClosed) || errors.Is(readErr, io.EOF) {
+			t.Fatalf("post-Close Read %d = %d, %v; want 0, fs.ErrClosed, non-EOF", i, n, readErr)
+		}
+	}
+}
+
+func TestBlobReaderLifecyclePublishesClosedBeforeUnderlyingCloseReturns(t *testing.T) {
+	t.Parallel()
+
+	underlying := newSerializedReadCloser(nil, nil)
+	underlying.blockClose = make(chan struct{})
+	store := newBlobStore(&scriptedGetObjSeam{fakeObjSeam: newFakeObjSeam(), reader: underlying})
+	reader, err := store.Get(context.Background(), "blobs/publish-close")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- reader.Close() }()
+	select {
+	case <-underlying.closeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("underlying Close did not start")
+	}
+	readDone := make(chan struct {
+		n   int
+		err error
+	}, 1)
+	go func() {
+		n, readErr := reader.Read(make([]byte, 1))
+		readDone <- struct {
+			n   int
+			err error
+		}{n: n, err: readErr}
+	}()
+	select {
+	case result := <-readDone:
+		if result.n != 0 || !errors.Is(result.err, fs.ErrClosed) {
+			t.Fatalf("Read during Close = %d, %v; want 0, fs.ErrClosed", result.n, result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("closed state was not published before underlying Close returned")
+	}
+	if calls := underlying.readCalls.Load(); calls != 0 {
+		t.Fatalf("underlying Read calls after closure = %d, want 0", calls)
+	}
+	close(underlying.blockClose)
+	if closeErr := <-closeDone; closeErr != nil {
+		t.Fatalf("Close = %v", closeErr)
+	}
+}
+
+func TestBlobReaderCloseBoundAdvertised(t *testing.T) {
+	t.Parallel()
+
+	store := newBlobStore(newFakeObjSeam())
+	if got := store.BlobReaderCloseBound(); got != 6*time.Second {
+		t.Fatalf("BlobReaderCloseBound = %v, want 6s", got)
+	}
+}
+
+type scriptedGetObjSeam struct {
+	*fakeObjSeam
+	reader io.ReadCloser
+}
+
+func (s *scriptedGetObjSeam) get(context.Context, string) (io.ReadCloser, error) {
+	return s.reader, nil
+}
+
+type serializedReadCloser struct {
+	mu           sync.Mutex
+	readStarted  chan struct{}
+	releaseRead  chan struct{}
+	closeStarted chan struct{}
+	blockClose   chan struct{}
+	readCause    error
+	closeCause   error
+	readOnce     sync.Once
+	closeOnce    sync.Once
+	readCalls    atomic.Int32
+	closeCalls   atomic.Int32
+}
+
+func newSerializedReadCloser(readCause, closeCause error) *serializedReadCloser {
+	return &serializedReadCloser{
+		readStarted:  make(chan struct{}),
+		releaseRead:  make(chan struct{}),
+		closeStarted: make(chan struct{}),
+		readCause:    readCause,
+		closeCause:   closeCause,
+	}
+}
+
+func (r *serializedReadCloser) Read([]byte) (int, error) {
+	r.readCalls.Add(1)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.readOnce.Do(func() { close(r.readStarted) })
+	<-r.releaseRead
+	return 0, r.readCause
+}
+
+func (r *serializedReadCloser) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.closeCalls.Add(1)
+	r.closeOnce.Do(func() { close(r.closeStarted) })
+	if r.blockClose != nil {
+		<-r.blockClose
+	}
+	return r.closeCause
 }
