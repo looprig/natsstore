@@ -76,9 +76,11 @@ result to repeated or concurrent callers. After Close returns, later Reads
 return no bytes and `fs.ErrClosed`; a successful Get never returns a literal or
 typed-nil reader.
 
-The provider caps the pinned nats.go ObjectResult context at five seconds and
-advertises a conservative six-second reader shutdown bound. Composition code
-can discover it without depending on a newer Storage contract:
+The provider owns an ordered, exact-subject pull consumer for each non-empty
+object reader. Every blocked chunk fetch has a five-second ceiling, while a
+reader that continues making progress has no absolute lifetime. The provider
+advertises a conservative six-second shutdown bound. Composition code can
+discover it without depending on a newer Storage contract:
 
 ```go
 type blobReaderLifecycle interface {
@@ -88,9 +90,10 @@ type blobReaderLifecycle interface {
 bound := st.Blobs.(blobReaderLifecycle).BlobReaderCloseBound()
 ```
 
-The five-second ObjectResult context also bounds a slow or abandoned streaming
-read; callers should continuously drain a returned reader and use object-level
-retry after a timeout. This is a local compatibility preparation only:
+The reader validates the ObjectStore chunk order, count, total size, and SHA-256
+digest before EOF. Caller cancellation and Close stop its ephemeral consumer;
+the server-side inactivity threshold bounds cleanup if immediate teardown is
+interrupted. This is a local compatibility preparation only:
 `go.mod` remains pinned to the published Storage v0.5.0 until a newer contract
 release exists.
 

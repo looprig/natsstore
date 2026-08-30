@@ -86,14 +86,15 @@ type blobStore struct {
 const (
 	blobObjectReadTimeout   = 5 * time.Second
 	blobReaderCloseOverhead = time.Second
+	blobReaderCloseBound    = blobObjectReadTimeout + blobReaderCloseOverhead
 )
 
 // BlobReaderCloseBound reports the maximum time a reader returned by Get may
 // take to stop an active provider-controlled Read and return from Close. The
-// pinned nats.go ObjectResult bounds a Read without a caller deadline at five
-// seconds; the extra second covers cancellation and local close completion.
+// provider bounds each ordered-consumer chunk fetch at five seconds; the extra
+// second covers cancellation and local close completion.
 func (*blobStore) BlobReaderCloseBound() time.Duration {
-	return blobObjectReadTimeout + blobReaderCloseOverhead
+	return blobReaderCloseBound
 }
 
 var _ storage.Blobs = (*blobStore)(nil)
@@ -163,13 +164,17 @@ func (s *blobStore) Get(ctx context.Context, key string) (io.ReadCloser, error) 
 }
 
 func isNilReadCloser(reader io.ReadCloser) bool {
-	if reader == nil {
+	return isNilInterface(reader)
+}
+
+func isNilInterface(value any) bool {
+	if value == nil {
 		return true
 	}
-	value := reflect.ValueOf(reader)
-	switch value.Kind() {
+	reflected := reflect.ValueOf(value)
+	switch reflected.Kind() {
 	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
-		return value.IsNil()
+		return reflected.IsNil()
 	default:
 		return false
 	}

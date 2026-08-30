@@ -3,10 +3,15 @@ package natsstore
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
+	"hash"
 	"io"
+	"io/fs"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -270,13 +275,19 @@ func leaseBucketConfig(bucket string, ttl time.Duration) jetstream.KeyValueConfi
 // directly.
 type jetStreamObjectSeam struct {
 	obj jetstream.ObjectStore
+	js  objectConsumerManager
+}
+
+type objectConsumerManager interface {
+	ObjectStore(context.Context, string) (jetstream.ObjectStore, error)
+	OrderedConsumer(context.Context, string, jetstream.OrderedConsumerConfig) (jetstream.Consumer, error)
 }
 
 var _ objSeam = (*jetStreamObjectSeam)(nil)
 
 // newJetStreamObjectSeam wraps obj as a production blob-store seam.
-func newJetStreamObjectSeam(obj jetstream.ObjectStore) *jetStreamObjectSeam {
-	return &jetStreamObjectSeam{obj: obj}
+func newJetStreamObjectSeam(obj jetstream.ObjectStore, js objectConsumerManager) *jetStreamObjectSeam {
+	return &jetStreamObjectSeam{obj: obj, js: js}
 }
 
 // put stores data under key (ObjectStore computes and records the SHA-256 digest itself),
@@ -287,39 +298,241 @@ func (s *jetStreamObjectSeam) put(ctx context.Context, key string, data []byte) 
 	return err
 }
 
-// get returns an ObjectStore result (an io.ReadCloser that verifies the digest
-// on read), bounded by both ctx and blobObjectReadTimeout, or errObjNotFound if
-// absent. The owned timeout keeps shutdown bounded even when a caller supplies a
-// later deadline; objectReadCloser cancels it when the reader closes sooner.
+const (
+	objectStreamPrefix = "OBJ_"
+	objectChunkPrefix  = "$O."
+	objectChunkMarker  = ".C."
+	objectLinkMaxDepth = 32
+)
+
+var errObjectIntegrity = errors.New("natsstore: object integrity failure")
+
+// get resolves ObjectStore links, then streams the exact chunk subject through
+// a provider-owned ordered pull consumer. Each Next has its own five-second
+// ceiling; there is deliberately no absolute lifetime for a progressing reader.
 func (s *jetStreamObjectSeam) get(ctx context.Context, key string) (io.ReadCloser, error) {
-	readCtx, cancel := context.WithTimeout(ctx, blobObjectReadTimeout)
-	res, err := s.obj.Get(readCtx, key)
+	info, err := s.resolveObjectInfo(ctx, s.obj, key, make(map[string]struct{}), 0)
 	if err != nil {
-		cancel()
 		if errors.Is(err, jetstream.ErrObjectNotFound) {
 			return nil, errObjNotFound
 		}
 		return nil, err
 	}
-	return &objectReadCloser{ReadCloser: res, cancel: cancel}, nil
-}
-
-// objectReadCloser owns the internal timeout context imposed on one streaming
-// ObjectResult. The outer blobLifecycleReader calls Close exactly once, while
-// this guard keeps the seam correct if it is exercised directly in tests.
-type objectReadCloser struct {
-	io.ReadCloser
-	cancel    context.CancelFunc
-	closeOnce sync.Once
-	closeErr  error
-}
-
-func (r *objectReadCloser) Close() error {
-	r.closeOnce.Do(func() {
-		r.cancel()
-		r.closeErr = r.ReadCloser.Close()
+	digest, err := jetstream.DecodeObjectDigest(info.Digest)
+	if err != nil || len(digest) != sha256.Size {
+		return nil, fmt.Errorf("%w: invalid digest", errObjectIntegrity)
+	}
+	r := &objectChunkReader{
+		callerCtx:      ctx,
+		expectedChunks: info.Chunks,
+		expectedSize:   info.Size,
+		expectedDigest: append([]byte(nil), digest...),
+		hash:           sha256.New(),
+		closeDone:      make(chan struct{}),
+	}
+	if info.Chunks == 0 {
+		if info.Size != 0 {
+			return nil, fmt.Errorf("%w: zero chunks with nonzero size", errObjectIntegrity)
+		}
+		r.stopCaller = func() bool { return true }
+		return r, nil
+	}
+	if info.Size == 0 || !validObjectToken(info.Bucket) || !validObjectToken(info.NUID) {
+		return nil, fmt.Errorf("%w: invalid chunk metadata", errObjectIntegrity)
+	}
+	r.stream = objectStreamPrefix + info.Bucket
+	r.subject = objectChunkPrefix + info.Bucket + objectChunkMarker + info.NUID
+	consumer, err := s.js.OrderedConsumer(ctx, r.stream, jetstream.OrderedConsumerConfig{
+		FilterSubjects:    []string{r.subject},
+		DeliverPolicy:     jetstream.DeliverAllPolicy,
+		InactiveThreshold: blobReaderCloseBound,
 	})
+	if err != nil {
+		return nil, err
+	}
+	if isNilInterface(consumer) {
+		return nil, fmt.Errorf("%w: nil ordered consumer", errObjectIntegrity)
+	}
+	messages, err := consumer.Messages(jetstream.PullMaxMessages(1))
+	if err != nil {
+		return nil, err
+	}
+	if isNilInterface(messages) {
+		return nil, fmt.Errorf("%w: nil messages context", errObjectIntegrity)
+	}
+	r.messages = messages
+	r.stopCaller = context.AfterFunc(ctx, r.stopMessages)
+	return r, nil
+}
+
+func (s *jetStreamObjectSeam) resolveObjectInfo(ctx context.Context, obj jetstream.ObjectStore, key string, seen map[string]struct{}, depth int) (*jetstream.ObjectInfo, error) {
+	if depth >= objectLinkMaxDepth {
+		return nil, fmt.Errorf("%w: object link depth exceeded", errObjectIntegrity)
+	}
+	info, err := obj.GetInfo(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	identity := info.Bucket + "\x00" + info.Name
+	if _, exists := seen[identity]; exists {
+		return nil, fmt.Errorf("%w: object link cycle", errObjectIntegrity)
+	}
+	seen[identity] = struct{}{}
+	link := (*jetstream.ObjectLink)(nil)
+	if info.Opts != nil {
+		link = info.Opts.Link
+	}
+	if link == nil {
+		return info, nil
+	}
+	if link.Name == "" {
+		return nil, jetstream.ErrCantGetBucket
+	}
+	target := obj
+	if link.Bucket != info.Bucket {
+		target, err = s.js.ObjectStore(ctx, link.Bucket)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return s.resolveObjectInfo(ctx, target, link.Name, seen, depth+1)
+}
+
+func validObjectToken(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, c := range value {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+type objectChunkReader struct {
+	callerCtx      context.Context
+	messages       jetstream.MessagesContext
+	stream         string
+	subject        string
+	expectedChunks uint32
+	expectedSize   uint64
+	expectedDigest []byte
+	hash           hash.Hash
+	chunk          []byte
+	offset         int
+	chunks         uint32
+	size           uint64
+	lastStreamSeq  uint64
+	complete       bool
+	terminal       error
+	readMu         sync.Mutex
+	closed         atomic.Bool
+	stopCaller     func() bool
+	stopOnce       sync.Once
+	closeOnce      sync.Once
+	closeDone      chan struct{}
+	closeErr       error
+}
+
+func (r *objectChunkReader) Read(p []byte) (int, error) {
+	r.readMu.Lock()
+	defer r.readMu.Unlock()
+	if r.closed.Load() {
+		return 0, fs.ErrClosed
+	}
+	if r.terminal != nil {
+		return 0, r.terminal
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if r.offset < len(r.chunk) {
+		n := copy(p, r.chunk[r.offset:])
+		r.offset += n
+		return n, nil
+	}
+	if r.complete || r.expectedChunks == 0 {
+		return 0, r.finish()
+	}
+	msg, err := r.messages.Next(jetstream.NextMaxWait(blobObjectReadTimeout))
+	if err != nil {
+		if r.closed.Load() {
+			err = fs.ErrClosed
+		} else if r.callerCtx.Err() != nil {
+			err = r.callerCtx.Err()
+		}
+		return 0, r.fail(err)
+	}
+	meta, err := msg.Metadata()
+	if err != nil {
+		return 0, r.fail(err)
+	}
+	nextChunk := r.chunks + 1
+	wantPending := uint64(r.expectedChunks - nextChunk)
+	if msg.Subject() != r.subject || meta.Stream != r.stream || meta.Sequence.Consumer != uint64(nextChunk) || meta.Sequence.Stream <= r.lastStreamSeq || meta.NumPending != wantPending {
+		return 0, r.fail(fmt.Errorf("%w: invalid chunk order", errObjectIntegrity))
+	}
+	data := msg.Data()
+	if uint64(len(data)) > r.expectedSize-r.size {
+		return 0, r.fail(fmt.Errorf("%w: object exceeds declared size", errObjectIntegrity))
+	}
+	_, _ = r.hash.Write(data)
+	r.chunk = data
+	r.offset = 0
+	r.chunks = nextChunk
+	r.size += uint64(len(data))
+	r.lastStreamSeq = meta.Sequence.Stream
+	r.complete = r.chunks == r.expectedChunks
+	n := copy(p, r.chunk)
+	r.offset = n
+	return n, nil
+}
+
+func (r *objectChunkReader) finish() error {
+	if r.chunks != r.expectedChunks || r.size != r.expectedSize {
+		return r.fail(fmt.Errorf("%w: chunk count or size mismatch", errObjectIntegrity))
+	}
+	sum := r.hash.Sum(nil)
+	if !bytes.Equal(sum, r.expectedDigest) {
+		return r.fail(jetstream.ErrDigestMismatch)
+	}
+	r.terminal = io.EOF
+	r.stopMessages()
+	return io.EOF
+}
+
+func (r *objectChunkReader) fail(err error) error {
+	r.terminal = err
+	r.stopMessages()
+	return err
+}
+
+func (r *objectChunkReader) Close() error {
+	r.closed.Store(true)
+	r.closeOnce.Do(func() {
+		r.stop()
+		r.stopMessages()
+		r.readMu.Lock()
+		close(r.closeDone)
+		r.readMu.Unlock()
+	})
+	<-r.closeDone
 	return r.closeErr
+}
+
+func (r *objectChunkReader) stop() {
+	if r.stopCaller != nil {
+		r.stopCaller()
+	}
+}
+
+func (r *objectChunkReader) stopMessages() {
+	r.stopOnce.Do(func() {
+		if r.messages != nil {
+			r.messages.Stop()
+		}
+	})
 }
 
 // delete removes key, bounded by ctx. An absent object surfaces as

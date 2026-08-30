@@ -454,8 +454,8 @@ func TestBlobsGetRejectsNilSeamReader(t *testing.T) {
 			store := newBlobStore(seam)
 			reader, err := store.Get(context.Background(), "blobs/nil-reader")
 			var opErr *BlobOpError
-			if reader != nil || !errors.As(err, &opErr) || opErr.Op != "get" {
-				t.Fatalf("Get = %v, %T %v; want nil, *BlobOpError(get)", reader, err, err)
+			if reader != nil || !errors.As(err, &opErr) || opErr.Key != "blobs/nil-reader" || opErr.Op != "get" || !errors.Is(err, errNilObjectReader) {
+				t.Fatalf("Get = %v, %T %v; want nil, *BlobOpError{Key: %q, Op: get} wrapping errNilObjectReader", reader, err, err, "blobs/nil-reader")
 			}
 		})
 	}

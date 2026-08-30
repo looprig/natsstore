@@ -3,6 +3,7 @@
 package natsstore
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -216,7 +217,7 @@ func newBlobsBackend(t *testing.T, root string, counter *atomic.Uint64) *blobSto
 	if err != nil {
 		t.Fatalf("CreateObjectStore: %v", err)
 	}
-	return newBlobStore(newJetStreamObjectSeam(obj))
+	return newBlobStore(newJetStreamObjectSeam(obj, js))
 }
 
 // TestBlobsConformance runs the full storage Blobs conformance suite against the
@@ -275,7 +276,18 @@ func TestBlobReaderCloseBoundWithMissingChunks(t *testing.T) {
 		t.Fatalf("Purge chunks: %v", err)
 	}
 
-	store := newBlobStore(newJetStreamObjectSeam(obj))
+	store := newBlobStore(newJetStreamObjectSeam(obj, js))
+	timeoutReader, err := store.Get(ctx, key)
+	if err != nil {
+		t.Fatalf("Get timeout reader: %v", err)
+	}
+	timeoutStarted := time.Now()
+	_, timeoutErr := timeoutReader.Read(make([]byte, 1))
+	timeoutElapsed := time.Since(timeoutStarted)
+	_ = timeoutReader.Close()
+	if timeoutErr == nil || timeoutElapsed < 4*time.Second || timeoutElapsed > store.BlobReaderCloseBound() {
+		t.Fatalf("blocked Read = %v after %v; want terminal error in [4s,%v]", timeoutErr, timeoutElapsed, store.BlobReaderCloseBound())
+	}
 	reader, err := store.Get(ctx, key)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
@@ -324,6 +336,118 @@ func TestBlobReaderCloseBoundWithMissingChunks(t *testing.T) {
 		if n, postErr := reader.Read(make([]byte, 1)); n != 0 || postErr == nil || errors.Is(postErr, io.EOF) {
 			t.Fatalf("post-Close Read %d = %d, %v; want non-EOF terminal error", i, n, postErr)
 		}
+	}
+}
+
+// TestBlobReaderAllowsProgressBeyondDefaultReadDeadline proves that the
+// provider's per-Read shutdown bound is not an absolute ObjectResult lifetime.
+// A reader that keeps consuming chunks may remain open longer than five seconds
+// and still complete digest verification successfully.
+func TestBlobReaderAllowsProgressBeyondDefaultReadDeadline(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", root)
+	eng, err := OpenEngine(EngineOptions{DataDir: filepath.Join(root, "jetstream"), SyncInterval: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("Open engine: %v", err)
+	}
+	t.Cleanup(func() { _ = eng.Close() })
+	js, err := jetstream.New(eng.Conn())
+	if err != nil {
+		t.Fatalf("jetstream.New: %v", err)
+	}
+	obj, err := js.CreateObjectStore(context.Background(), objectStoreConfig("blob_slow_reader"))
+	if err != nil {
+		t.Fatalf("CreateObjectStore: %v", err)
+	}
+
+	const chunkSize = 128 * 1024
+	want := bytes.Repeat([]byte("slow-reader-data"), 64*1024)
+	meta := jetstream.ObjectMeta{Name: "blobs/slow", Opts: &jetstream.ObjectMetaOptions{ChunkSize: chunkSize}}
+	if _, err := obj.Put(context.Background(), meta, bytes.NewReader(want)); err != nil {
+		t.Fatalf("ObjectStore.Put: %v", err)
+	}
+	store := newBlobStore(newJetStreamObjectSeam(obj, js))
+	reader, err := store.Get(context.Background(), "blobs/slow")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	defer reader.Close()
+
+	started := time.Now()
+	var got bytes.Buffer
+	buf := make([]byte, chunkSize)
+	for {
+		n, readErr := reader.Read(buf)
+		got.Write(buf[:n])
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			t.Fatalf("Read after %v: %v", time.Since(started), readErr)
+		}
+		time.Sleep(750 * time.Millisecond)
+	}
+	if elapsed := time.Since(started); elapsed <= blobObjectReadTimeout {
+		t.Fatalf("read completed in %v; want nonvacuous duration beyond old %v total cap", elapsed, blobObjectReadTimeout)
+	}
+	if !bytes.Equal(got.Bytes(), want) {
+		t.Fatalf("read %d bytes, want %d identical bytes", got.Len(), len(want))
+	}
+}
+
+func TestBlobReaderFollowsObjectLinks(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", root)
+	eng, err := OpenEngine(EngineOptions{DataDir: filepath.Join(root, "jetstream"), SyncInterval: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = eng.Close() })
+	js, err := jetstream.New(eng.Conn())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	rootStore, err := js.CreateObjectStore(ctx, objectStoreConfig("blob_link_root"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetStore, err := js.CreateObjectStore(ctx, objectStoreConfig("blob_link_target"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := targetStore.PutString(ctx, "target", "linked payload")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rootStore.AddLink(ctx, "cross-link", target); err != nil {
+		t.Fatal(err)
+	}
+	local, err := rootStore.PutString(ctx, "local", "local payload")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rootStore.AddLink(ctx, "same-link", local); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rootStore.AddBucketLink(ctx, "bucket-link", targetStore); err != nil {
+		t.Fatal(err)
+	}
+	store := newBlobStore(newJetStreamObjectSeam(rootStore, js))
+	for key, want := range map[string]string{"cross-link": "linked payload", "same-link": "local payload"} {
+		reader, getErr := store.Get(ctx, key)
+		if getErr != nil {
+			t.Fatalf("Get(%q): %v", key, getErr)
+		}
+		got, readErr := io.ReadAll(reader)
+		closeErr := reader.Close()
+		if readErr != nil || closeErr != nil || string(got) != want {
+			t.Fatalf("Get(%q) = %q, %v, Close %v; want %q", key, got, readErr, closeErr, want)
+		}
+	}
+	if _, err := store.Get(ctx, "bucket-link"); !errors.Is(err, jetstream.ErrCantGetBucket) {
+		t.Fatalf("Get(bucket-link) = %v, want ErrCantGetBucket", err)
 	}
 }
 

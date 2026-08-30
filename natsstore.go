@@ -339,7 +339,7 @@ func buildComposite(ctx context.Context, conn *nats.Conn, reporter localPathRepo
 	ledger := newLedgerStore(newJetStreamSeam(jsLegacy))
 	leaser := newLeaserStore(newJetStreamKVSeam(buckets.lease), defaultLeaseTTL, time.Now)
 	kv := newKVStore(newJetStreamKVStoreSeam(buckets.kv))
-	blobs := newBlobStore(newJetStreamObjectSeam(buckets.obj))
+	blobs := newBlobStore(newJetStreamObjectSeam(buckets.obj, jsx))
 	ordered := newOrderedStore(newJetStreamOrderedSeam(conn, jsx))
 	ledger.localPathReporter = reporter
 	leaser.localPathReporter = reporter
