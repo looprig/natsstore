@@ -237,6 +237,39 @@ func TestBlobsConformance(t *testing.T) {
 	})
 }
 
+// TestBlobReaderLifecycleConformance runs Storage's shared optional lifecycle
+// suite through the public Store composition path. The runtime assertion pins
+// that embedding blobStore behind storage.Composite.Blobs does not erase the
+// concrete provider's lifecycle capability.
+func TestBlobReaderLifecycleConformance(t *testing.T) {
+	root := t.TempDir()
+	var counter atomic.Uint64
+
+	storetest.TestBlobReaderLifecycle(t, func(t *testing.T) storage.BlobReaderLifecycle {
+		n := counter.Add(1)
+		openCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		st, err := Open(openCtx, Options{
+			EmbeddedDir: filepath.Join(root, "lifecycle"+strconv.FormatUint(n, 10)),
+		})
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		t.Cleanup(func() {
+			closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := st.Close(closeCtx); err != nil {
+				t.Errorf("Close: %v", err)
+			}
+		})
+		lifecycle, ok := st.Blobs.(storage.BlobReaderLifecycle)
+		if !ok {
+			t.Fatalf("public Blobs provider %T does not preserve BlobReaderLifecycle", st.Blobs)
+		}
+		return lifecycle
+	})
+}
+
 // TestBlobReaderCloseBoundWithMissingChunks is the provider-native nonvacuity
 // proof for Blob reader shutdown. It leaves valid object metadata in place but
 // purges the referenced chunks, forcing the provider-owned plain pull consumer's

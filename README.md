@@ -68,35 +68,34 @@ case silently weakens atomicity or order guarantees.
 
 ## Blob reader lifecycle
 
-The planned v0.5.1 release makes each reader returned by `Blobs.Get` safe for
-bounded shutdown while retaining JetStream's streaming ObjectStore path. Close
-publishes closure before touching the ObjectStore result, is safe concurrent
-with Read, calls the underlying Close exactly once, and returns one stable
-result to repeated or concurrent callers. After Close returns, later Reads
-return no bytes and `fs.ErrClosed`; a successful Get never returns a literal or
-typed-nil reader.
+The planned v0.5.1 release implements Storage v0.6.0's
+`storage.BlobReaderLifecycle` capability. Each reader returned by `Blobs.Get`
+supports bounded shutdown while retaining JetStream's streaming ObjectStore
+path. Close publishes closure before touching the ObjectStore result, is safe
+concurrent with Read, calls the underlying Close exactly once, and returns one
+stable result to repeated or concurrent callers. After Close returns, later
+Reads return no bytes and `fs.ErrClosed`; a successful Get never returns a
+literal or typed-nil reader.
 
 The provider owns an ephemeral, exact-subject pull consumer for each non-empty
 object reader. Every blocked chunk fetch has a five-second ceiling, while a
 reader that continues making progress has no absolute lifetime. The provider
 uses AckNone, in-memory consumer state, and no client-side auto-reset path, then
 advertises a conservative six-second shutdown bound. Composition code can
-discover it without depending on a newer Storage contract:
+discover the optional capability through the Storage contract:
 
 ```go
-type blobReaderLifecycle interface {
-    BlobReaderCloseBound() time.Duration
+if lifecycle, ok := st.Blobs.(storage.BlobReaderLifecycle); ok {
+    bound := lifecycle.BlobReaderCloseBound()
+    _ = bound
 }
-
-bound := st.Blobs.(blobReaderLifecycle).BlobReaderCloseBound()
 ```
 
 The reader validates the ObjectStore chunk order, count, total size, and SHA-256
 digest before EOF. Caller cancellation and Close stop its ephemeral consumer;
 the server-side inactivity threshold bounds cleanup if immediate teardown is
-interrupted. This is a local compatibility preparation only:
-`go.mod` remains pinned to the published Storage v0.5.0 until a newer contract
-release exists.
+interrupted. The provider runs Storage's shared lifecycle conformance suite and
+retains its native missing-chunk blocked-read shutdown proof.
 
 ## Dependencies
 

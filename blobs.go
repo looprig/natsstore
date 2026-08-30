@@ -97,7 +97,10 @@ func (*blobStore) BlobReaderCloseBound() time.Duration {
 	return blobReaderCloseBound
 }
 
-var _ storage.Blobs = (*blobStore)(nil)
+var (
+	_ storage.Blobs               = (*blobStore)(nil)
+	_ storage.BlobReaderLifecycle = (*blobStore)(nil)
+)
 
 // newBlobStore builds a blob store over seam.
 func newBlobStore(seam objSeam) *blobStore {
