@@ -1,6 +1,6 @@
 module github.com/looprig/natsstore
 
-go 1.26.6
+go 1.26.8
 
 require (
 	github.com/nats-io/nats-server/v2 v2.14.5
