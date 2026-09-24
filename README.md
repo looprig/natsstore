@@ -1,6 +1,6 @@
 # natsstore
 
-`natsstore` implements [`storage`](../storage)'s five storage primitives — `Ledger`,
+`natsstore` implements [`storage`](https://github.com/looprig/storage)'s five storage primitives — `Ledger`,
 `Leaser`, `KV`, `Blobs`, and `OrderedIndex` — over **NATS JetStream**. It is the only module in the tree
 that depends on the NATS packages; consumers depend on the neutral `storage` contracts and
 wire `natsstore` in at their composition root.
@@ -19,6 +19,27 @@ A `natsstore.Store` runs over one of two backends, chosen at `Open`:
   `InsecureSkipVerify`) and owns only the connection.
 
 Exactly one of `URL` / `EmbeddedDir` must be set (else an `*OptionsError`).
+
+## Status
+
+- Implements all five storage primitives and conforms to the `github.com/looprig/storage`
+  v0.7.0 contract, including its nested-name KV and Blobs cases (a name and a name extending
+  it with `/…` coexist).
+- Implements the optional `storage.BlobReaderLifecycle` capability (bounded Blob reader
+  shutdown, since v0.5.1), so it satisfies consumers such as `sessionstore.Open` that require
+  it.
+- Also exports the lower-level embedded-engine API (`OpenEngine`, `OpenLockedEngine`) that
+  `Open` builds on; `OpenLockedEngine` takes a cross-process store lock, `Open`'s embedded
+  mode does not.
+
+## Install
+
+```sh
+go get github.com/looprig/natsstore@latest
+```
+
+It sits in tier 1 of the Looprig graph (foundation adapters); its only Looprig dependency is
+`github.com/looprig/storage`.
 
 ## Usage
 
@@ -68,8 +89,8 @@ case silently weakens atomicity or order guarantees.
 
 ## Blob reader lifecycle
 
-The planned v0.5.1 release implements Storage v0.6.0's
-`storage.BlobReaderLifecycle` capability. Each reader returned by `Blobs.Get`
+natsstore implements Storage's optional `storage.BlobReaderLifecycle`
+capability (introduced in storage v0.6.0). Each reader returned by `Blobs.Get`
 supports bounded shutdown while retaining JetStream's streaming ObjectStore
 path. Close publishes closure before touching the ObjectStore result, is safe
 concurrent with Read, calls the underlying Close exactly once, and returns one
@@ -102,3 +123,22 @@ retains its native missing-chunk blocked-read shutdown proof.
 The NATS dependencies are sanctioned **only in this module** (`github.com/nats-io/nats.go`
 for the JetStream client, `github.com/nats-io/nats-server/v2` for the embedded in-process
 server). Everything else is stdlib plus the local `storage` contracts. See `CLAUDE.md`.
+
+## Development
+
+The baseline is Go 1.26.8. Verify the module standalone, never against a workspace:
+
+```sh
+GOWORK=off go test ./...
+make check              # fmt-check, vet, staticcheck, gosec, govulncheck, race tests, build
+make test-integration   # GOWORK=off go test -tags integration -race ./...
+```
+
+The `integration` build tag enables the storage conformance suite and the JetStream
+integration tests. They run against an embedded in-process server in a temporary directory,
+so no external NATS server is required. `examples/embedded` is a runnable example of the
+embedded mode.
+
+## License
+
+Apache License 2.0; see [LICENSE](LICENSE).
